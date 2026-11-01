@@ -624,14 +624,14 @@ HWC2::Error HWCLayer::SetLayerVisibleRegion(hwc_region_t visible) {
 }
 
 HWC2::Error HWCLayer::SetLayerZOrder(uint32_t z) {
-  if (z_ != z) {
 #ifdef UDFPS_ZPOS
-    if (z & FOD_PRESSED_LAYER_ZORDER) {
-      fod_pressed_ = true;
-      z &= ~FOD_PRESSED_LAYER_ZORDER;
-    }
+  // IchthysOS: the flag is re-evaluated on every Z update, so it also clears again (it used to
+  // latch at true for the layer's lifetime), and z_ only ever holds the real Z: a flagged Z no
+  // longer counts as a geometry change on every frame.
+  fod_pressed_ = (z & FOD_PRESSED_LAYER_ZORDER) != 0;
+  z &= ~FOD_PRESSED_LAYER_ZORDER;
 #endif
-
+  if (z_ != z) {
     geometry_changes_ |= kZOrder;
     z_ = z;
   }

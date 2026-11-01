@@ -476,6 +476,19 @@ void DRMConnector::ParseProperties() {
       PopulateFrameTriggerModes(info);
     } else if (prop_enum == DRMProperty::COLORSPACE) {
       PopulateSupportedColorspaces(info);
+    } else if (prop_enum == DRMProperty::FINGERPRINT_MASK) {
+      // IchthysOS: only a kernel whose sde_connector_pre_kickoff applies the property (it then
+      // installs it with range 0..1023; stock Samsung code is 0..100 and, with the property at 1,
+      // would cancel a pending mask OFF) gets it driven. Elsewhere it stays unused, and the
+      // fingerprint HAL falls back to mask_brightness.
+      bool frame_synced = (info->flags & DRM_MODE_PROP_RANGE) && info->count_values >= 2 &&
+                          info->values[1] >= 1023;
+      if (!frame_synced) {
+        DRM_LOGI("Connector %d: fingerprint_mask is not frame-synced on this kernel, unused",
+                 drm_connector_->connector_id);
+        drmModeFreeProperty(info);
+        continue;
+      }
     }
 
     prop_mgr_.SetPropertyId(prop_enum, info->prop_id);
@@ -971,6 +984,20 @@ void DRMConnector::Perform(DRMOps code, drmModeAtomicReq *req, va_list args) {
         }
       } else {
         DRM_LOGE("Invalid colorspace %d", colorspace);
+      }
+    } break;
+
+    case DRMOps::CONNECTOR_SET_FINGERPRINT_MASK: {
+      // IchthysOS: Samsung kernels only; elsewhere the property does not exist and this is a no-op.
+      uint32_t fingerprint_mask = va_arg(args, uint32_t);
+      if (!prop_mgr_.IsPropertyAvailable(DRMProperty::FINGERPRINT_MASK)) {
+        return;
+      }
+      uint32_t prop_id = prop_mgr_.GetPropertyId(DRMProperty::FINGERPRINT_MASK);
+      int ret = drmModeAtomicAddProperty(req, obj_id, prop_id, fingerprint_mask);
+      if (ret < 0) {
+        DRM_LOGE("AtomicAddProperty failed obj_id 0x%x, prop_id %d fingerprint_mask %d ret %d",
+                 obj_id, prop_id, fingerprint_mask, ret);
       }
     } break;
 

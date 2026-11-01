@@ -435,6 +435,13 @@ enum struct DRMOps {
    *      uint32_t - colorspace value bit-mask
    */
   CONNECTOR_SET_COLORSPACE,
+  /*
+   * IchthysOS: Op: Sets the Samsung "fingerprint_mask" connector property (UDFPS mask HBM,
+   * applied by the kernel at this commit's kickoff, see sde_connector_pre_kickoff).
+   * Arg: uint32_t - Connector ID
+   *      uint32_t - 0 = mask off, 1 = mask on (default level), >1 = mask level
+   */
+  CONNECTOR_SET_FINGERPRINT_MASK,
 };
 
 enum struct DRMRotation {

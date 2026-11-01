@@ -173,6 +173,7 @@ enum struct DRMProperty {
   DSPP_CAPABILITIES,
   SPR_INIT_CFG_V1,
   DSPP_RC_MASK_V1,
+  FINGERPRINT_MASK,  // IchthysOS: Samsung connector property, see CONNECTOR_SET_FINGERPRINT_MASK
 
   // Insert above
   MAX

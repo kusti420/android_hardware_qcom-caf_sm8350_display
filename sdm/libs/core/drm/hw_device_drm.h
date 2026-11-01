@@ -192,6 +192,7 @@ class HWDeviceDRM : public HWInterface {
   DisplayError AtomicCommit(HWLayers *hw_layers);
   void SetupAtomic(Fence::ScopedRef &scoped_ref, HWLayers *hw_layers, bool validate,
                    int64_t *release_fence_fd, int64_t *retire_fence_fd);
+  void SetupFingerprintMask(const HWLayersInfo &hw_layer_info, bool validate);  // IchthysOS
   void SetSecureConfig(const LayerBuffer &input_buffer, sde_drm::DRMSecureMode *fb_secure_mode,
                        sde_drm::DRMSecurityLevel *security_level);
   bool IsResolutionSwitchEnabled() const { return resolution_switch_enabled_; }
@@ -272,6 +273,7 @@ class HWDeviceDRM : public HWInterface {
   uint32_t vrefresh_ = 0;
   uint32_t panel_mode_changed_ = 0;
   bool reset_output_fence_offset_ = false;
+  uint32_t fingerprint_mask_ = 0;  // IchthysOS: last committed "fingerprint_mask" value
   uint64_t bit_clk_rate_ = 0;
   bool update_mode_ = false;
   HWPowerState pending_power_state_ = kPowerStateNone;

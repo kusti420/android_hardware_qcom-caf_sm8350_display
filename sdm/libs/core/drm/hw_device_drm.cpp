@@ -80,6 +80,7 @@
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/stat.h>
+#include <sys/system_properties.h>
 #include <sys/types.h>
 #include <unistd.h>
 #include <utils/constants.h>
@@ -1305,15 +1306,12 @@ void HWDeviceDRM::SetupAtomic(Fence::ScopedRef &scoped_ref, HWLayers *hw_layers,
         if (update_config) {
           drm_atomic_intf_->Perform(DRMOps::PLANE_SET_ALPHA, pipe_id, layer.plane_alpha);
 
-#ifdef UDFPS_ZPOS
-          uint32_t z_order = pipe_info->z_order;
-          if (layer.flags.fod_pressed) {
-            z_order |= FOD_PRESSED_LAYER_ZORDER;
-          }
-          drm_atomic_intf_->Perform(DRMOps::PLANE_SET_ZORDER, pipe_id, z_order);
-#else
+          // IchthysOS: the FOD bit is deliberately NOT put on the plane's zpos. On this kernel it
+          // makes the mixer insert its own full-screen dim layer under the plane (sde_crtc
+          // fod_dim_lut), on top of SystemUI's nits-matched dim. The FOD layer is reported through
+          // the connector's fingerprint_mask instead (SetupFingerprintMask), which also works when
+          // the layer was composed by the GPU and has no plane at all.
           drm_atomic_intf_->Perform(DRMOps::PLANE_SET_ZORDER, pipe_id, pipe_info->z_order);
-#endif
 
           // Account for PMA block activation directly at translation time to preserve layer
           // blending definition and avoid issues when a layer structure is reused.
@@ -1406,6 +1404,8 @@ void HWDeviceDRM::SetupAtomic(Fence::ScopedRef &scoped_ref, HWLayers *hw_layers,
     }
     drm_atomic_intf_->Perform(DRMOps::CONNECTOR_SET_QSYNC_MODE, token_.conn_id, mode);
   }
+
+  SetupFingerprintMask(hw_layer_info, validate);
 
   drm_atomic_intf_->Perform(DRMOps::DPPS_COMMIT_FEATURE, 0 /* argument is not used */);
   drm_atomic_intf_->Perform(DRMOps::COMMIT_PANEL_FEATURES, 0 /* argument is not used */);
@@ -1539,6 +1539,72 @@ void HWDeviceDRM::SetSolidfillStages() {
 void HWDeviceDRM::ClearSolidfillStages() {
   solid_fills_.clear();
   SetSolidfillStages();
+}
+
+#ifdef UDFPS_ZPOS
+// IchthysOS: frame-synced UDFPS mask HBM (Samsung optical fingerprint panels).
+// persist.ichthys.udfps_sync (bool, default false) switches it at runtime, read through the
+// property's serial so the per-frame cost is one atomic load. SystemUI and the fingerprint HAL read
+// the same switch.
+static bool IchthysUdfpsSyncEnabled() {
+  static const prop_info *info = nullptr;
+  static uint32_t last_serial = 0;
+  static bool enabled = false;
+  if (!info) {
+    info = __system_property_find("persist.ichthys.udfps_sync");
+    if (!info) {
+      return false;
+    }
+    last_serial = __system_property_serial(info) + 1;  // force the first read
+  }
+  uint32_t serial = __system_property_serial(info);
+  if (serial != last_serial) {
+    last_serial = serial;
+    __system_property_read_callback(info, [](void *cookie, const char *, const char *value,
+                                             uint32_t) {
+      *static_cast<bool *>(cookie) = !strcmp(value, "1") || !strcmp(value, "true");
+    }, &enabled);
+  }
+  return enabled;
+}
+#endif  // UDFPS_ZPOS
+
+void HWDeviceDRM::SetupFingerprintMask(const HWLayersInfo &hw_layer_info, bool validate) {
+#ifdef UDFPS_ZPOS
+  if (connector_info_.type != DRM_MODE_CONNECTOR_DSI) {
+    return;
+  }
+  bool enabled = IchthysUdfpsSyncEnabled();
+  if (!enabled && !fingerprint_mask_) {
+    return;  // switched off and nothing to release: today's behaviour, property untouched
+  }
+  // SurfaceFlinger flags SystemUI's mask layer (window "UdfpsFodMask") with
+  // FOD_PRESSED_LAYER_ZORDER; HWCLayer::SetLayerZOrder turns that into flags.fod_pressed. All
+  // layers of the stack count, device- or GPU-composed.
+  bool fod_present = false;
+  if (enabled && hw_layer_info.stack) {
+    for (const Layer *layer : hw_layer_info.stack->layers) {
+      if (layer && layer->flags.fod_pressed) {
+        fod_present = true;
+        break;
+      }
+    }
+  }
+  // 1 = mask on at the kernel's default level (331, what the HAL writes). The kernel reacts to
+  // changes only, in the kickoff of the commit that carries them, i.e. together with the frame
+  // that first shows / first no longer shows the mask layer.
+  uint32_t value = fod_present ? 1 : 0;
+  drm_atomic_intf_->Perform(DRMOps::CONNECTOR_SET_FINGERPRINT_MASK, token_.conn_id, value);
+  if (!validate) {
+    if (value != fingerprint_mask_) {
+      DLOGI("IchthysOS udfps_sync: fingerprint_mask %u -> %u", fingerprint_mask_, value);
+    }
+    fingerprint_mask_ = value;
+  }
+#else
+  (void)hw_layer_info;
+  (void)validate;
+#endif
 }
 
 DisplayError HWDeviceDRM::Validate(HWLayers *hw_layers) {
