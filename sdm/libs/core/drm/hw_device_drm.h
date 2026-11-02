@@ -193,6 +193,11 @@ class HWDeviceDRM : public HWInterface {
   void SetupAtomic(Fence::ScopedRef &scoped_ref, HWLayers *hw_layers, bool validate,
                    int64_t *release_fence_fd, int64_t *retire_fence_fd);
   void SetupFingerprintMask(const HWLayersInfo &hw_layer_info, bool validate);  // IchthysOS
+  // IchthysOS: UDFPS mask tone curve on the DSPP gamma correction (GC) block, frame-synced with
+  // fingerprint_mask. See SetupFingerprintLut() in hw_device_drm.cpp.
+  void SetupFingerprintLut(bool fod_present);
+  void CacheFingerprintLutBase(const sde_drm::DRMPPFeatureInfo &pgc);
+  void *BuildFingerprintLutPgc(bool mask_curve);
   void SetSecureConfig(const LayerBuffer &input_buffer, sde_drm::DRMSecureMode *fb_secure_mode,
                        sde_drm::DRMSecurityLevel *security_level);
   bool IsResolutionSwitchEnabled() const { return resolution_switch_enabled_; }
@@ -274,6 +279,14 @@ class HWDeviceDRM : public HWInterface {
   uint32_t panel_mode_changed_ = 0;
   bool reset_output_fence_offset_ = false;
   uint32_t fingerprint_mask_ = 0;  // IchthysOS: last committed "fingerprint_mask" value
+  // IchthysOS: UDFPS mask tone curve (DSPP GC). udfps_pgc_base_ is the GC the colour manager
+  // (QDCM colour mode) last set, as 3 x 1024 10-bit entries in DRM component order (c0 = G,
+  // c1 = B, c2 = R); empty = GC off. It is what mask-off restores and what the curve is composed on.
+  std::vector<uint16_t> udfps_pgc_base_ = {};
+  uint64_t udfps_pgc_base_flags_ = 0;
+  bool udfps_lut_applied_ = false;  // the GC we last put in a request holds the mask curve
+  bool udfps_lut_resend_ = false;   // re-send the wanted GC with the next commit
+  bool udfps_lut_in_req_ = false;   // the request being committed carries a GC set
   uint64_t bit_clk_rate_ = 0;
   bool update_mode_ = false;
   HWPowerState pending_power_state_ = kPowerStateNone;

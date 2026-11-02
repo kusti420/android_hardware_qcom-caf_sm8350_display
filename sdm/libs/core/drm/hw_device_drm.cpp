@@ -88,6 +88,9 @@
 #include <utils/formats.h>
 #include <utils/sys.h>
 #include <display/drm/sde_drm.h>
+#if defined(UDFPS_ZPOS) && defined(PP_DRM_ENABLE)
+#include <display/drm/msm_drm_pp.h>  // IchthysOS: drm_msm_pgc_lut for the UDFPS mask tone curve
+#endif
 #include <private/color_params.h>
 #include <utils/rect.h>
 #include <utils/utils.h>
@@ -1575,7 +1578,7 @@ void HWDeviceDRM::SetupFingerprintMask(const HWLayersInfo &hw_layer_info, bool v
     return;
   }
   bool enabled = IchthysUdfpsSyncEnabled();
-  if (!enabled && !fingerprint_mask_) {
+  if (!enabled && !fingerprint_mask_ && !udfps_lut_applied_ && !udfps_lut_resend_) {
     return;  // switched off and nothing to release: today's behaviour, property untouched
   }
   // SurfaceFlinger flags SystemUI's mask layer (window "UdfpsFodMask") with
@@ -1600,10 +1603,232 @@ void HWDeviceDRM::SetupFingerprintMask(const HWLayersInfo &hw_layer_info, bool v
       DLOGI("IchthysOS udfps_sync: fingerprint_mask %u -> %u", fingerprint_mask_, value);
     }
     fingerprint_mask_ = value;
+    // IchthysOS: the mask tone curve goes into the same request as fingerprint_mask, so the DSPP
+    // GC flips with the frame whose kickoff sends the mask HBM. Only the real commit carries it:
+    // the GC does not take part in validation, and SDE colour-processing properties are latched
+    // by the kernel even from a TEST_ONLY commit.
+    SetupFingerprintLut(fod_present);
   }
 #else
   (void)hw_layer_info;
   (void)validate;
+#endif
+}
+
+#if defined(UDFPS_ZPOS) && defined(PP_DRM_ENABLE)
+// IchthysOS: UDFPS mask tone curve.
+// Under the global mask HBM the panel's response curve differs from normal mode (whites redder,
+// shadows deeper), which a uniform dim plus a colour matrix cannot undo. A per-channel 1D curve is
+// therefore put on the DSPP gamma correction block (GC v1.8, CRTC property "SDE_DSPP_GC_V1",
+// struct drm_msm_pgc_lut) for exactly the frames that carry the mask layer.
+//
+// Source: three persist props, one per channel, each 66 characters = 33 knots x 2 base64url
+// characters (A-Z a-z 0-9 - _, big-endian: value = 64 * idx(c0) + idx(c1), 0..4095):
+//   persist.ichthys.udfps_lut_r / persist.ichthys.udfps_lut_g / persist.ichthys.udfps_lut_b
+// Knot k (0..32) is the 12-bit output for normalised input k/32. Expansion to the 1024-entry
+// 10-bit GC table, integer-exact so the calibration script can reproduce it bit for bit:
+//   num = i * 32; k = num / 1023; rem = num % 1023;            (i = input code 0..1023)
+//   acc = (k == 32) ? y[32] * 1023 : y[k] * (1023 - rem) + y[k + 1] * rem;
+//   out[i] = (2 * acc + 4095) / (2 * 4095);                      (round half up, 0..1023)
+// Identity curve: "AACAEAGAIAKAMAOAQASAUAWAYAaAcAeAgAh_j_l_n_p_r_t_v_x_z_1_3_5_7_9___".
+// The curve is applied after the colour mode's own GC (if the mode uses one):
+//   gc[i] = curve[mode_gc[i]]   (curve = identity-domain function of the final 10-bit code)
+// All three props must be valid, otherwise there is no curve (today's behaviour). Empty or unset
+// = off. Re-read whenever one of the props' serials changes; the per-frame cost is three atomic
+// loads, and only while the mask is shown.
+namespace {
+
+constexpr int kUdfpsLutKnots = 33;
+constexpr int kUdfpsLutStrLen = kUdfpsLutKnots * 2;
+constexpr int kUdfpsLutEntries = 1024;
+// DRM GC component order is the SDE pixel order C0 = G, C1 = B, C2 = R (sde_hw_mdss.h C0_G_Y...);
+// index here is that component, the name the user-facing channel.
+const char *const kUdfpsLutProps[3] = {
+  "persist.ichthys.udfps_lut_g",  // c0
+  "persist.ichthys.udfps_lut_b",  // c1
+  "persist.ichthys.udfps_lut_r",  // c2
+};
+
+struct IchthysUdfpsLut {
+  const prop_info *info[3] = {};
+  uint32_t serial[3] = {};
+  bool valid = false;
+  uint16_t lut[3][kUdfpsLutEntries] = {};
+};
+IchthysUdfpsLut g_udfps_lut;
+
+int UdfpsLutB64(char c) {
+  if (c >= 'A' && c <= 'Z') return c - 'A';
+  if (c >= 'a' && c <= 'z') return c - 'a' + 26;
+  if (c >= '0' && c <= '9') return c - '0' + 52;
+  if (c == '-') return 62;
+  if (c == '_') return 63;
+  return -1;
+}
+
+bool ParseUdfpsLut(const std::string &value, uint16_t *out) {
+  if (value.size() != kUdfpsLutStrLen) {
+    return false;
+  }
+  uint32_t y[kUdfpsLutKnots];
+  for (int k = 0; k < kUdfpsLutKnots; k++) {
+    int hi = UdfpsLutB64(value[2 * k]);
+    int lo = UdfpsLutB64(value[2 * k + 1]);
+    if (hi < 0 || lo < 0) {
+      return false;
+    }
+    y[k] = UINT32(hi * 64 + lo);
+  }
+  for (uint32_t i = 0; i < kUdfpsLutEntries; i++) {
+    uint32_t num = i * (kUdfpsLutKnots - 1);
+    uint32_t k = num / 1023;
+    uint32_t rem = num % 1023;
+    uint32_t acc = (k >= kUdfpsLutKnots - 1) ? y[kUdfpsLutKnots - 1] * 1023
+                                               : y[k] * (1023 - rem) + y[k + 1] * rem;
+    out[i] = static_cast<uint16_t>((2 * acc + 4095) / (2 * 4095));
+  }
+  return true;
+}
+
+// Returns true when any of the three props changed (appeared, or a new serial) since the last
+// call; g_udfps_lut.valid / .lut then hold the re-parsed curve.
+bool PollUdfpsLut() {
+  bool changed = false;
+  for (int c = 0; c < 3; c++) {
+    if (!g_udfps_lut.info[c]) {
+      g_udfps_lut.info[c] = __system_property_find(kUdfpsLutProps[c]);
+      if (!g_udfps_lut.info[c]) {
+        continue;
+      }
+      g_udfps_lut.serial[c] = __system_property_serial(g_udfps_lut.info[c]);
+      changed = true;
+      continue;
+    }
+    uint32_t serial = __system_property_serial(g_udfps_lut.info[c]);
+    if (serial != g_udfps_lut.serial[c]) {
+      g_udfps_lut.serial[c] = serial;
+      changed = true;
+    }
+  }
+  if (!changed) {
+    return false;
+  }
+  bool valid = true;
+  for (int c = 0; c < 3 && valid; c++) {
+    std::string value;
+    if (g_udfps_lut.info[c]) {
+      __system_property_read_callback(g_udfps_lut.info[c], [](void *cookie, const char *,
+                                                              const char *v, uint32_t) {
+        *static_cast<std::string *>(cookie) = v;
+      }, &value);
+    }
+    valid = ParseUdfpsLut(value, g_udfps_lut.lut[c]);
+  }
+  if (valid != g_udfps_lut.valid || valid) {
+    DLOGI("IchthysOS udfps_lut: curve %s", valid ? "loaded" : "invalid or unset, off");
+  }
+  g_udfps_lut.valid = valid;
+  return true;
+}
+
+}  // namespace
+#endif  // UDFPS_ZPOS && PP_DRM_ENABLE
+
+// IchthysOS: remembers the GC the colour manager sets (SetPPFeatures), so mask-off can restore it
+// exactly and mask-on can compose the curve on top of it.
+void HWDeviceDRM::CacheFingerprintLutBase(const DRMPPFeatureInfo &pgc) {
+#if defined(UDFPS_ZPOS) && defined(PP_DRM_ENABLE)
+  const drm_msm_pgc_lut *lut = static_cast<const drm_msm_pgc_lut *>(pgc.payload);
+  if (!lut || pgc.payload_size != sizeof(drm_msm_pgc_lut)) {
+    udfps_pgc_base_.clear();
+    udfps_pgc_base_flags_ = 0;
+    return;
+  }
+  const uint32_t *src[3] = {lut->c0, lut->c1, lut->c2};
+  udfps_pgc_base_.resize(3 * kUdfpsLutEntries);
+  for (int c = 0; c < 3; c++) {
+    uint16_t *dst = &udfps_pgc_base_[c * kUdfpsLutEntries];
+    for (int i = 0; i < PGC_TBL_LEN; i++) {  // two 10-bit entries per word: even low, odd << 16
+      dst[2 * i] = static_cast<uint16_t>(src[c][i] & 0x3FF);
+      dst[2 * i + 1] = static_cast<uint16_t>((src[c][i] >> 16) & 0x3FF);
+    }
+  }
+  udfps_pgc_base_flags_ = lut->flags;
+#else
+  (void)pgc;
+#endif
+}
+
+// IchthysOS: builds the GC payload to commit: the colour mode's GC alone (mask_curve false; nullptr
+// = GC off, which is the colour mode's state when it set none) or the mask curve composed on it.
+// Caller owns the result (delete as drm_msm_pgc_lut).
+void *HWDeviceDRM::BuildFingerprintLutPgc(bool mask_curve) {
+#if defined(UDFPS_ZPOS) && defined(PP_DRM_ENABLE)
+  bool have_base = udfps_pgc_base_.size() == 3 * kUdfpsLutEntries;
+  if (!mask_curve && !have_base) {
+    return nullptr;
+  }
+  drm_msm_pgc_lut *out = new drm_msm_pgc_lut();
+  out->flags = have_base ? udfps_pgc_base_flags_ : 0;
+  uint32_t *dst[3] = {out->c0, out->c1, out->c2};
+  for (int c = 0; c < 3; c++) {
+    uint16_t entry[2];
+    for (int i = 0; i < PGC_TBL_LEN; i++) {
+      for (int j = 0; j < 2; j++) {
+        uint32_t idx = UINT32(2 * i + j);
+        uint32_t v = have_base ? udfps_pgc_base_[c * kUdfpsLutEntries + idx] : idx;
+        if (mask_curve) {
+          v = g_udfps_lut.lut[c][v & 0x3FF];
+        }
+        entry[j] = static_cast<uint16_t>(v & 0x3FF);
+      }
+      dst[c][i] = UINT32(entry[0]) | (UINT32(entry[1]) << 16);
+    }
+  }
+  return out;
+#else
+  (void)mask_curve;
+  return nullptr;
+#endif
+}
+
+// IchthysOS: puts the wanted GC (mask curve while the mask layer is shown and a valid curve is
+// set, else the colour mode's own GC) into the request on changes only. Commit path only.
+void HWDeviceDRM::SetupFingerprintLut(bool fod_present) {
+#if defined(UDFPS_ZPOS) && defined(PP_DRM_ENABLE)
+  bool curve_changed = false;
+  bool want = false;
+  if (fod_present) {
+    curve_changed = PollUdfpsLut();
+    want = g_udfps_lut.valid;
+  }
+  if (want == udfps_lut_applied_ && !udfps_lut_resend_ && !(want && curve_changed)) {
+    return;
+  }
+  DRMPPFeatureInfo info = {};
+  info.id = sde_drm::kFeaturePgc;
+  drm_mgr_intf_->GetCrtcPPInfo(token_.crtc_id, &info);
+  if (info.version == std::numeric_limits<uint32_t>::max() || !hw_color_mgr_) {
+    udfps_lut_applied_ = false;  // no DSPP GC on this CRTC: nothing to do, ever
+    udfps_lut_resend_ = false;
+    return;
+  }
+  drm_msm_pgc_lut *payload = static_cast<drm_msm_pgc_lut *>(BuildFingerprintLutPgc(want));
+  info.id = sde_drm::kFeaturePgc;
+  info.type = sde_drm::kPropBlob;
+  info.payload = payload;
+  info.payload_size = sizeof(drm_msm_pgc_lut);
+  // Same path as the colour manager: DRMPPManager owns the blob and frees the previous one.
+  drm_atomic_intf_->Perform(DRMOps::CRTC_SET_POST_PROC, token_.crtc_id, &info);
+  delete payload;
+  if (want != udfps_lut_applied_) {
+    DLOGI("IchthysOS udfps_lut: GC %s", want ? "mask curve" : "restored");
+  }
+  udfps_lut_applied_ = want;
+  udfps_lut_resend_ = false;
+  udfps_lut_in_req_ = true;
+#else
+  (void)fod_present;
 #endif
 }
 
@@ -1718,6 +1943,10 @@ DisplayError HWDeviceDRM::AtomicCommit(HWLayers *hw_layers) {
   int ret = drm_atomic_intf_->Commit(sync_commit, false /* retain_planes*/);
   shared_ptr<Fence> release_fence = Fence::Create(INT(release_fence_fd), "release");
   shared_ptr<Fence> retire_fence = Fence::Create(INT(retire_fence_fd), "retire");
+  if (ret && udfps_lut_in_req_) {
+    udfps_lut_resend_ = true;  // IchthysOS: the UDFPS mask GC may not have landed; send it again
+  }
+  udfps_lut_in_req_ = false;
   if (ret) {
     DLOGE("%s failed with error %d crtc %d", __FUNCTION__, ret, token_.crtc_id);
     DumpHWLayers(hw_layers);
@@ -1988,6 +2217,25 @@ DisplayError HWDeviceDRM::SetPPFeatures(PPFeaturesConfig *feature_list) {
 
       kernel_params.id = id;
       ret = hw_color_mgr_->GetDrmFeature(feature, &kernel_params);
+#if defined(UDFPS_ZPOS) && defined(PP_DRM_ENABLE)
+      // IchthysOS: the colour mode's GC is the base the UDFPS mask curve is composed on and what
+      // mask-off restores. While the curve is applied, a new mode GC goes in composed.
+      if (!ret && crtc_feature && id == DRMPPFeatureID::kFeaturePgc) {
+        CacheFingerprintLutBase(kernel_params);
+        if (udfps_lut_applied_) {
+          DRMPPFeatureInfo composed = kernel_params;
+          drm_msm_pgc_lut *payload = static_cast<drm_msm_pgc_lut *>(BuildFingerprintLutPgc(true));
+          composed.payload = payload;
+          composed.payload_size = sizeof(drm_msm_pgc_lut);
+          drm_atomic_intf_->Perform(DRMOps::CRTC_SET_POST_PROC, token_.crtc_id, &composed);
+          delete payload;
+          udfps_lut_in_req_ = true;
+          hw_color_mgr_->FreeDrmFeatureData(&kernel_params);
+          continue;
+        }
+        udfps_lut_in_req_ = true;
+      }
+#endif
       if (!ret && crtc_feature)
         drm_atomic_intf_->Perform(DRMOps::CRTC_SET_POST_PROC,
                                   token_.crtc_id, &kernel_params);
