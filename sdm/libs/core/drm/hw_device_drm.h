@@ -195,7 +195,8 @@ class HWDeviceDRM : public HWInterface {
   void SetupFingerprintMask(const HWLayersInfo &hw_layer_info, bool validate);  // IchthysOS
   // IchthysOS: UDFPS mask tone curve on the DSPP gamma correction (GC) block, frame-synced with
   // fingerprint_mask. See SetupFingerprintLut() in hw_device_drm.cpp.
-  void SetupFingerprintLut(bool fod_present);
+  void SetupFingerprintLut(bool fod_present, bool mask_on_edge);
+  float GetUdfpsBrightness();  // IchthysOS: 0..255 setting unit, -1 = unreadable
   void CacheFingerprintLutBase(const sde_drm::DRMPPFeatureInfo &pgc);
   void *BuildFingerprintLutPgc(bool mask_curve);
   void SetSecureConfig(const LayerBuffer &input_buffer, sde_drm::DRMSecureMode *fb_secure_mode,

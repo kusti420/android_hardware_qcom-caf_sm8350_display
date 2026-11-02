@@ -1602,12 +1602,13 @@ void HWDeviceDRM::SetupFingerprintMask(const HWLayersInfo &hw_layer_info, bool v
     if (value != fingerprint_mask_) {
       DLOGI("IchthysOS udfps_sync: fingerprint_mask %u -> %u", fingerprint_mask_, value);
     }
+    bool mask_on_edge = value && !fingerprint_mask_;  // IchthysOS: first frame of this mask
     fingerprint_mask_ = value;
     // IchthysOS: the mask tone curve goes into the same request as fingerprint_mask, so the DSPP
     // GC flips with the frame whose kickoff sends the mask HBM. Only the real commit carries it:
     // the GC does not take part in validation, and SDE colour-processing properties are latched
     // by the kernel even from a TEST_ONLY commit.
-    SetupFingerprintLut(fod_present);
+    SetupFingerprintLut(fod_present, mask_on_edge);
   }
 #else
   (void)hw_layer_info;
@@ -1622,9 +1623,11 @@ void HWDeviceDRM::SetupFingerprintMask(const HWLayersInfo &hw_layer_info, bool v
 // therefore put on the DSPP gamma correction block (GC v1.8, CRTC property "SDE_DSPP_GC_V1",
 // struct drm_msm_pgc_lut) for exactly the frames that carry the mask layer.
 //
-// Source: three persist props, one per channel, each 66 characters = 33 knots x 2 base64url
-// characters (A-Z a-z 0-9 - _, big-endian: value = 64 * idx(c0) + idx(c1), 0..4095):
-//   persist.ichthys.udfps_lut_r / persist.ichthys.udfps_lut_g / persist.ichthys.udfps_lut_b
+// Source: three persist props per calibration point, one per channel, each 66 characters =
+// 33 knots x 2 base64url characters (A-Z a-z 0-9 - _, big-endian: value = 64 * idx(c0) + idx(c1),
+// 0..4095):
+//   point 0: persist.ichthys.udfps_lut_r  / _g  / _b      (the original single curve)
+//   point n: persist.ichthys.udfps_lut<n>_r / _g / _b     (n = 1..3)
 // Knot k (0..32) is the 12-bit output for normalised input k/32. Expansion to the 1024-entry
 // 10-bit GC table, integer-exact so the calibration script can reproduce it bit for bit:
 //   num = i * 32; k = num / 1023; rem = num % 1023;            (i = input code 0..1023)
@@ -1633,25 +1636,56 @@ void HWDeviceDRM::SetupFingerprintMask(const HWLayersInfo &hw_layer_info, bool v
 // Identity curve: "AACAEAGAIAKAMAOAQASAUAWAYAaAcAeAgAh_j_l_n_p_r_t_v_x_z_1_3_5_7_9___".
 // The curve is applied after the colour mode's own GC (if the mode uses one):
 //   gc[i] = curve[mode_gc[i]]   (curve = identity-domain function of the final 10-bit code)
-// All three props must be valid, otherwise there is no curve (today's behaviour). Empty or unset
-// = off. Re-read whenever one of the props' serials changes; the per-frame cost is three atomic
-// loads, and only while the mask is shown.
+// A point counts only when all three of its props are valid. Empty or unset = no curve.
+//
+// IchthysOS: brightness-dependent calibration (up to 4 points). The panel's normal-mode response
+// differs per brightness, so one curve fits one brightness only.
+//   persist.ichthys.udfps_lut_bl = comma list of screen brightness levels, field n = point n,
+//   e.g. "8,128,230" (an empty field = that point has no level). Unit: Android's 0..255 brightness
+//   setting (Settings.System.screen_brightness; float brightness f = (v - 1) / 254), the same unit
+//   as SystemUI's Settings.Global ichthys_udfps_cal_alpha.
+// Unset / no usable level: point 0 alone, exactly the old single-curve behaviour, no brightness
+// read. Otherwise the points with a valid curve AND a level form the table (if none: point 0 alone
+// when valid). With two or more points the panel's backlight level is read once at mask-on
+// (GetUdfpsBrightness), converted to the 0..255 setting unit, and the knots are interpolated
+// linearly between the two nearest points (clamped to the end points):
+//   t = (bl - bl_a) / (bl_b - bl_a);  y[k] = round(y_a[k] + (y_b[k] - y_a[k]) * t)
+// then expanded as above. Props are re-checked on every mask frame through the property area's
+// serial (one atomic load when nothing changed).
 namespace {
 
 constexpr int kUdfpsLutKnots = 33;
 constexpr int kUdfpsLutStrLen = kUdfpsLutKnots * 2;
 constexpr int kUdfpsLutEntries = 1024;
+constexpr int kUdfpsLutPoints = 4;
 // DRM GC component order is the SDE pixel order C0 = G, C1 = B, C2 = R (sde_hw_mdss.h C0_G_Y...);
 // index here is that component, the name the user-facing channel.
-const char *const kUdfpsLutProps[3] = {
-  "persist.ichthys.udfps_lut_g",  // c0
-  "persist.ichthys.udfps_lut_b",  // c1
-  "persist.ichthys.udfps_lut_r",  // c2
+const char *const kUdfpsLutProps[kUdfpsLutPoints][3] = {
+  {"persist.ichthys.udfps_lut_g", "persist.ichthys.udfps_lut_b", "persist.ichthys.udfps_lut_r"},
+  {"persist.ichthys.udfps_lut1_g", "persist.ichthys.udfps_lut1_b", "persist.ichthys.udfps_lut1_r"},
+  {"persist.ichthys.udfps_lut2_g", "persist.ichthys.udfps_lut2_b", "persist.ichthys.udfps_lut2_r"},
+  {"persist.ichthys.udfps_lut3_g", "persist.ichthys.udfps_lut3_b", "persist.ichthys.udfps_lut3_r"},
+};
+const char *const kUdfpsLutBlProp = "persist.ichthys.udfps_lut_bl";
+
+struct IchthysUdfpsProp {
+  const prop_info *info = nullptr;
+  uint32_t serial = 0;
 };
 
 struct IchthysUdfpsLut {
-  const prop_info *info[3] = {};
-  uint32_t serial[3] = {};
+  bool polled = false;
+  uint32_t area_serial = 0;
+  IchthysUdfpsProp curve_prop[kUdfpsLutPoints][3];
+  IchthysUdfpsProp bl_prop;
+  // Calibration table, ascending brightness. One entry = the single-curve case (level unused).
+  int num_points = 0;
+  float level[kUdfpsLutPoints] = {};
+  uint16_t knots[kUdfpsLutPoints][3][kUdfpsLutKnots] = {};
+  float fallback_level = 0.0f;  // used when the brightness cannot be read: point 0's level
+  // The expanded curve last built and the brightness it was built for.
+  bool built = false;
+  float built_level = -1.0f;
   bool valid = false;
   uint16_t lut[3][kUdfpsLutEntries] = {};
 };
@@ -1666,68 +1700,215 @@ int UdfpsLutB64(char c) {
   return -1;
 }
 
-bool ParseUdfpsLut(const std::string &value, uint16_t *out) {
+bool ParseUdfpsKnots(const std::string &value, uint16_t *y) {
   if (value.size() != kUdfpsLutStrLen) {
     return false;
   }
-  uint32_t y[kUdfpsLutKnots];
   for (int k = 0; k < kUdfpsLutKnots; k++) {
     int hi = UdfpsLutB64(value[2 * k]);
     int lo = UdfpsLutB64(value[2 * k + 1]);
     if (hi < 0 || lo < 0) {
       return false;
     }
-    y[k] = UINT32(hi * 64 + lo);
-  }
-  for (uint32_t i = 0; i < kUdfpsLutEntries; i++) {
-    uint32_t num = i * (kUdfpsLutKnots - 1);
-    uint32_t k = num / 1023;
-    uint32_t rem = num % 1023;
-    uint32_t acc = (k >= kUdfpsLutKnots - 1) ? y[kUdfpsLutKnots - 1] * 1023
-                                               : y[k] * (1023 - rem) + y[k + 1] * rem;
-    out[i] = static_cast<uint16_t>((2 * acc + 4095) / (2 * 4095));
+    y[k] = static_cast<uint16_t>(hi * 64 + lo);
   }
   return true;
 }
 
-// Returns true when any of the three props changed (appeared, or a new serial) since the last
-// call; g_udfps_lut.valid / .lut then hold the re-parsed curve.
-bool PollUdfpsLut() {
-  bool changed = false;
-  for (int c = 0; c < 3; c++) {
-    if (!g_udfps_lut.info[c]) {
-      g_udfps_lut.info[c] = __system_property_find(kUdfpsLutProps[c]);
-      if (!g_udfps_lut.info[c]) {
-        continue;
-      }
-      g_udfps_lut.serial[c] = __system_property_serial(g_udfps_lut.info[c]);
-      changed = true;
+void ExpandUdfpsKnots(const uint16_t *y, uint16_t *out) {
+  for (uint32_t i = 0; i < kUdfpsLutEntries; i++) {
+    uint32_t num = i * (kUdfpsLutKnots - 1);
+    uint32_t k = num / 1023;
+    uint32_t rem = num % 1023;
+    uint32_t acc = (k >= kUdfpsLutKnots - 1) ? UINT32(y[kUdfpsLutKnots - 1]) * 1023
+                                               : UINT32(y[k]) * (1023 - rem) + UINT32(y[k + 1]) * rem;
+    out[i] = static_cast<uint16_t>((2 * acc + 4095) / (2 * 4095));
+  }
+}
+
+// Returns true when the prop appeared or got a new serial since the last call.
+bool PollUdfpsProp(IchthysUdfpsProp *p, const char *name) {
+  if (!p->info) {
+    p->info = __system_property_find(name);
+    if (!p->info) {
+      return false;
+    }
+    p->serial = __system_property_serial(p->info);
+    return true;
+  }
+  uint32_t serial = __system_property_serial(p->info);
+  if (serial == p->serial) {
+    return false;
+  }
+  p->serial = serial;
+  return true;
+}
+
+std::string ReadUdfpsProp(const IchthysUdfpsProp &p) {
+  std::string value;
+  if (p.info) {
+    __system_property_read_callback(p.info, [](void *cookie, const char *, const char *v,
+                                               uint32_t) {
+      *static_cast<std::string *>(cookie) = v;
+    }, &value);
+  }
+  return value;
+}
+
+// "8,128,230" -> level[n] / has[n] per field; returns the number of usable levels.
+int ParseUdfpsLevels(const std::string &value, float *level, bool *has) {
+  int count = 0;
+  size_t pos = 0;
+  for (int n = 0; n < kUdfpsLutPoints; n++) {
+    has[n] = false;
+    if (pos > value.size()) {
       continue;
     }
-    uint32_t serial = __system_property_serial(g_udfps_lut.info[c]);
-    if (serial != g_udfps_lut.serial[c]) {
-      g_udfps_lut.serial[c] = serial;
-      changed = true;
+    size_t end = value.find(',', pos);
+    std::string field = value.substr(pos, end == std::string::npos ? std::string::npos
+                                                                     : end - pos);
+    pos = (end == std::string::npos) ? value.size() + 1 : end + 1;
+    const char *s = field.c_str();
+    while (*s == ' ') s++;
+    if (!*s) {
+      continue;
+    }
+    char *stop = nullptr;
+    float v = strtof(s, &stop);
+    while (stop && *stop == ' ') stop++;
+    if (!stop || *stop || !(v >= 0.0f && v <= 1000.0f)) {
+      continue;
+    }
+    level[n] = v;
+    has[n] = true;
+    count++;
+  }
+  return count;
+}
+
+// Re-reads the calibration table when any of its props changed. Returns true when it did (the
+// curve must then be rebuilt).
+bool PollUdfpsLut() {
+  IchthysUdfpsLut &t = g_udfps_lut;
+  uint32_t area_serial = __system_property_area_serial();
+  if (t.polled && area_serial == t.area_serial) {
+    return false;  // no property anywhere was added or changed since the last poll
+  }
+  bool changed = false;
+  t.polled = true;
+  t.area_serial = area_serial;
+  for (int p = 0; p < kUdfpsLutPoints; p++) {
+    for (int c = 0; c < 3; c++) {
+      changed |= PollUdfpsProp(&t.curve_prop[p][c], kUdfpsLutProps[p][c]);
     }
   }
+  changed |= PollUdfpsProp(&t.bl_prop, kUdfpsLutBlProp);
   if (!changed) {
     return false;
   }
-  bool valid = true;
-  for (int c = 0; c < 3 && valid; c++) {
-    std::string value;
-    if (g_udfps_lut.info[c]) {
-      __system_property_read_callback(g_udfps_lut.info[c], [](void *cookie, const char *,
-                                                              const char *v, uint32_t) {
-        *static_cast<std::string *>(cookie) = v;
-      }, &value);
+
+  bool curve_ok[kUdfpsLutPoints] = {};
+  uint16_t knots[kUdfpsLutPoints][3][kUdfpsLutKnots] = {};
+  for (int p = 0; p < kUdfpsLutPoints; p++) {
+    curve_ok[p] = true;
+    for (int c = 0; c < 3 && curve_ok[p]; c++) {
+      curve_ok[p] = ParseUdfpsKnots(ReadUdfpsProp(t.curve_prop[p][c]), knots[p][c]);
     }
-    valid = ParseUdfpsLut(value, g_udfps_lut.lut[c]);
   }
-  if (valid != g_udfps_lut.valid || valid) {
-    DLOGI("IchthysOS udfps_lut: curve %s", valid ? "loaded" : "invalid or unset, off");
+  float level[kUdfpsLutPoints] = {};
+  bool has_level[kUdfpsLutPoints] = {};
+  int num_levels = ParseUdfpsLevels(ReadUdfpsProp(t.bl_prop), level, has_level);
+
+  int order[kUdfpsLutPoints];
+  int n = 0;
+  if (num_levels > 0) {
+    for (int p = 0; p < kUdfpsLutPoints; p++) {
+      if (curve_ok[p] && has_level[p]) {
+        order[n++] = p;
+      }
+    }
+    std::stable_sort(order, order + n, [&level](int a, int b) { return level[a] < level[b]; });
   }
-  g_udfps_lut.valid = valid;
+  if (n == 0 && curve_ok[0]) {
+    order[n++] = 0;  // no brightness list (or none usable): point 0 alone, the old behaviour
+    level[0] = 0.0f;
+  }
+  int prev_points = t.num_points;
+  t.num_points = n;
+  for (int i = 0; i < n; i++) {
+    t.level[i] = level[order[i]];
+    memcpy(t.knots[i], knots[order[i]], sizeof(t.knots[i]));
+  }
+  t.fallback_level = (n > 0 && curve_ok[0] && has_level[0]) ? level[0] : (n > 0 ? t.level[0] : 0.0f);
+  t.built = false;
+  if (n == 0) {
+    if (prev_points > 0) {
+      DLOGI("IchthysOS udfps_lut: curve invalid or unset, off");
+    }
+  } else if (n == 1) {
+    DLOGI("IchthysOS udfps_lut: curve loaded (point %d alone)", order[0]);
+  } else {
+    DLOGI("IchthysOS udfps_lut: %d calibration points loaded, brightness %.1f .. %.1f", n,
+          t.level[0], t.level[n - 1]);
+  }
+  return true;
+}
+
+// Builds g_udfps_lut.lut for the screen brightness bl (0..255 setting unit; ignored with fewer
+// than two points). Returns true when the curve content may have changed.
+bool BuildUdfpsLut(float bl) {
+  IchthysUdfpsLut &t = g_udfps_lut;
+  if (t.num_points == 0) {
+    bool was_valid = t.valid;
+    t.valid = false;
+    t.built = true;
+    return was_valid;
+  }
+  if (t.num_points == 1) {
+    if (t.built) {
+      return false;
+    }
+    for (int c = 0; c < 3; c++) {
+      ExpandUdfpsKnots(t.knots[0][c], t.lut[c]);
+    }
+    t.valid = t.built = true;
+    t.built_level = -1.0f;
+    return true;
+  }
+  if (t.built && bl == t.built_level) {
+    return false;
+  }
+  int a = 0;
+  int b = 0;
+  float f = 0.0f;
+  if (bl <= t.level[0]) {
+    a = b = 0;
+  } else if (bl >= t.level[t.num_points - 1]) {
+    a = b = t.num_points - 1;
+  } else {
+    for (int i = 0; i + 1 < t.num_points; i++) {
+      if (bl >= t.level[i] && bl < t.level[i + 1]) {
+        a = i;
+        b = i + 1;
+        f = (bl - t.level[i]) / (t.level[i + 1] - t.level[i]);
+        break;
+      }
+    }
+  }
+  for (int c = 0; c < 3; c++) {
+    uint16_t y[kUdfpsLutKnots];
+    for (int k = 0; k < kUdfpsLutKnots; k++) {
+      float ya = t.knots[a][c][k];
+      float yb = t.knots[b][c][k];
+      long v = lroundf(ya + (yb - ya) * f);
+      y[k] = static_cast<uint16_t>(std::max(0L, std::min(4095L, v)));
+    }
+    ExpandUdfpsKnots(y, t.lut[c]);
+  }
+  DLOGI("IchthysOS udfps_lut: curve for brightness %.1f (%.1f..%.1f, t %.3f)", bl, t.level[a],
+        t.level[b], f);
+  t.valid = t.built = true;
+  t.built_level = bl;
   return true;
 }
 
@@ -1792,14 +1973,51 @@ void *HWDeviceDRM::BuildFingerprintLutPgc(bool mask_curve) {
 #endif
 }
 
+// IchthysOS: the screen brightness for picking the UDFPS mask curve, in the unit of the
+// calibration table (Android's 0..255 setting). Source: the panel's backlight node
+// /sys/class/backlight/panel<N>-backlight/brightness (HWPeripheralDRM::GetPanelBrightness; the
+// same node SetPanelBrightness writes, so it holds the level actually sent to the panel, after
+// auto-brightness / dimming). Its scale is 0..max_brightness (486 on this panel: 0..255 normal
+// range, 256..486 the outdoor HBM range); the composer writes level = int(f * (max - min) + min)
+// for the framework's brightness float f (min = 1). That is undone here (+0.5 = the middle of the
+// truncated step) and mapped to the setting unit v = 1 + 254 * f. Returns -1 when unreadable.
+float HWDeviceDRM::GetUdfpsBrightness() {
+  int level = 0;
+  if (GetPanelBrightness(&level) != kErrorNone) {
+    return -1.0f;
+  }
+  if (level <= 0) {
+    return 0.0f;
+  }
+  float max = hw_panel_info_.panel_max_brightness;
+  float min = hw_panel_info_.panel_min_brightness;
+  if (max <= min) {
+    return FLOAT(level);
+  }
+  float f = (FLOAT(level) + 0.5f - min) / (max - min);
+  return 1.0f + 254.0f * std::max(0.0f, std::min(1.0f, f));
+}
+
 // IchthysOS: puts the wanted GC (mask curve while the mask layer is shown and a valid curve is
 // set, else the colour mode's own GC) into the request on changes only. Commit path only.
-void HWDeviceDRM::SetupFingerprintLut(bool fod_present) {
+// mask_on_edge = first frame of a mask: with several calibration points the brightness is read
+// then (and when the table changes), not per frame.
+void HWDeviceDRM::SetupFingerprintLut(bool fod_present, bool mask_on_edge) {
 #if defined(UDFPS_ZPOS) && defined(PP_DRM_ENABLE)
   bool curve_changed = false;
   bool want = false;
   if (fod_present) {
-    curve_changed = PollUdfpsLut();
+    bool table_changed = PollUdfpsLut();
+    float bl = g_udfps_lut.built_level;
+    if (g_udfps_lut.num_points >= 2 &&
+        (mask_on_edge || table_changed || !g_udfps_lut.built)) {
+      bl = GetUdfpsBrightness();
+      if (bl < 0.0f) {
+        bl = g_udfps_lut.built ? g_udfps_lut.built_level : g_udfps_lut.fallback_level;
+        DLOGW("IchthysOS udfps_lut: brightness unreadable, using %.1f", bl);
+      }
+    }
+    curve_changed = BuildUdfpsLut(bl);
     want = g_udfps_lut.valid;
   }
   if (want == udfps_lut_applied_ && !udfps_lut_resend_ && !(want && curve_changed)) {
@@ -1829,6 +2047,7 @@ void HWDeviceDRM::SetupFingerprintLut(bool fod_present) {
   udfps_lut_in_req_ = true;
 #else
   (void)fod_present;
+  (void)mask_on_edge;
 #endif
 }
 
