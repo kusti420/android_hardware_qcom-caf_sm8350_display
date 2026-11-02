@@ -97,6 +97,7 @@
 #include <utils/fence.h>
 
 #include <sstream>
+#include <cmath>
 #include <ctime>
 #include <algorithm>
 #include <string>
@@ -1652,6 +1653,32 @@ void HWDeviceDRM::SetupFingerprintMask(const HWLayersInfo &hw_layer_info, bool v
 //   t = (bl - bl_a) / (bl_b - bl_a);  y[k] = round(y_a[k] + (y_b[k] - y_a[k]) * t)
 // then expanded as above. Props are re-checked on every mask frame through the property area's
 // serial (one atomic load when nothing changed).
+//
+// IchthysOS: parametric, automatically brightness-dependent curve. Used only when NO knot point
+// above has all three props valid (knot props keep precedence; SystemUI applies the same rule).
+// In this mode the dim window is only a small separator (keep ~0.94, alpha ~15) so the content's
+// codes stay <= 255 * keep and the illumination disc (code 255) can be told apart; the curve does
+// ALL the darkening plus the colour / tone correction, at the GC's full 10-bit output.
+// persist.ichthys.udfps_model = 12 numbers, separated by spaces or commas, per channel r, g, b in
+// that order: a0 a1 p0 p1. For the panel's backlight level L (sysfs, 0..486, clamped to 1..486),
+// read once at mask-on like above:
+//   A_c = clamp(exp(a0_c + a1_c * ln L), 0.01, 4)     p_c = clamp(p0_c + p1_c * ln L, 0.6, 1.6)
+// A_c is the TOTAL factor (normal-mode look of a content level, expressed in mask-HBM codes), not
+// relative to any dim. With keep = 1 - alpha / 255 (the separator), x = i / 1023 and a knee two
+// 10-bit steps above keep (the composed top content code 255 * keep expands to ~1023 * keep + 0.2,
+// it must stay on the content side):
+//   knee = min(1, keep + 2 / 1023)
+//   x <= knee:  g(x) = min(1, A_c * (x / keep)^p_c)
+//   x >  knee:  g(x) = g_top + (x - knee) * (1 - g_top) / max(1e-6, 1 - knee),  g_top = g(knee)
+//   gc[i] = clamp(floor(g(x) * 1023 + 0.5), 0, 1023)     (double precision; keep >= 0.02)
+// udfps_lut_ref.py model_table() is the reference implementation. Identity tone with only the
+// separator undone: "0 0 1 0" per channel.
+// keep: ichthys.udfps_applied_alpha (0..255), published by SystemUI right before it adds the mask
+// window, i.e. the separator that frame really carries (Settings.Global ichthys_udfps_sep_alpha
+// overrides included). Unset / invalid (older SystemUI): persist.ichthys.udfps_sep_keep, the
+// separator SystemUI uses by default (0.5..1, default 0.94):
+//   alpha = max(1, round((1 - keep) * 255)).
+// Both alpha props are polled every mask frame (a changed separator rebuilds the curve).
 namespace {
 
 constexpr int kUdfpsLutKnots = 33;
@@ -1667,6 +1694,10 @@ const char *const kUdfpsLutProps[kUdfpsLutPoints][3] = {
   {"persist.ichthys.udfps_lut3_g", "persist.ichthys.udfps_lut3_b", "persist.ichthys.udfps_lut3_r"},
 };
 const char *const kUdfpsLutBlProp = "persist.ichthys.udfps_lut_bl";
+const char *const kUdfpsModelProp = "persist.ichthys.udfps_model";
+const char *const kUdfpsAlphaProp = "ichthys.udfps_applied_alpha";
+const char *const kUdfpsSepKeepProp = "persist.ichthys.udfps_sep_keep";
+constexpr int kUdfpsModelParams = 12;
 
 struct IchthysUdfpsProp {
   const prop_info *info = nullptr;
@@ -1683,13 +1714,31 @@ struct IchthysUdfpsLut {
   float level[kUdfpsLutPoints] = {};
   uint16_t knots[kUdfpsLutPoints][3][kUdfpsLutKnots] = {};
   float fallback_level = 0.0f;  // used when the brightness cannot be read: point 0's level
-  // The expanded curve last built and the brightness it was built for.
+  // IchthysOS: parametric model (persist.ichthys.udfps_model), used when no knot point is valid.
+  IchthysUdfpsProp model_prop;
+  bool knots_present = false;  // some point has all three knot props valid
+  bool model_valid = false;
+  double model[kUdfpsModelParams] = {};
+  // The expanded curve last built and the brightness (model: panel level and alpha) it was built
+  // for.
   bool built = false;
   float built_level = -1.0f;
+  int built_alpha = -1;
   bool valid = false;
   uint16_t lut[3][kUdfpsLutEntries] = {};
 };
 IchthysUdfpsLut g_udfps_lut;
+
+// IchthysOS: the separator alpha for the model: SystemUI's published one, else from the keep prop.
+struct IchthysUdfpsAlpha {
+  bool polled = false;
+  uint32_t area_serial = 0;
+  IchthysUdfpsProp applied_prop;
+  IchthysUdfpsProp keep_prop;
+  int applied = -1;
+  int fallback = -1;
+};
+IchthysUdfpsAlpha g_udfps_alpha;
 
 int UdfpsLutB64(char c) {
   if (c >= 'A' && c <= 'Z') return c - 'A';
@@ -1786,6 +1835,102 @@ int ParseUdfpsLevels(const std::string &value, float *level, bool *has) {
   return count;
 }
 
+// IchthysOS: parametric mask curve model (see the comment at the top of this section). Pure
+// functions; the calibration dir's udfps_model_test.py compiles the block between the markers on
+// the host and compares it with udfps_lut_ref.py.
+// UDFPS_MODEL_MATH_BEGIN
+// DRM component c (0 = G, 1 = B, 2 = R) -> channel index in the prop (r, g, b).
+constexpr int kUdfpsModelChannel[3] = {1, 2, 0};
+
+bool UdfpsModelSep(char c) {
+  return c == ' ' || c == ',' || c == '\t';
+}
+
+// "a0r a1r p0r p1r a0g ... p1b" -> params[12]; false unless exactly 12 finite numbers.
+bool ParseUdfpsModel(const std::string &value, double *params) {
+  const char *s = value.c_str();
+  int n = 0;
+  for (;;) {
+    while (UdfpsModelSep(*s)) s++;
+    if (!*s) {
+      break;
+    }
+    if (n == kUdfpsModelParams) {
+      return false;
+    }
+    char *stop = nullptr;
+    double v = strtod(s, &stop);
+    if (stop == s || (*stop && !UdfpsModelSep(*stop)) || !std::isfinite(v) || fabs(v) > 100.0) {
+      return false;
+    }
+    params[n++] = v;
+    s = stop;
+  }
+  return n == kUdfpsModelParams;
+}
+
+// "0".."255" -> alpha, else -1.
+int ParseUdfpsAlpha(const std::string &value) {
+  const char *s = value.c_str();
+  while (*s == ' ') s++;
+  if (*s < '0' || *s > '9') {
+    return -1;
+  }
+  char *stop = nullptr;
+  long v = strtol(s, &stop, 10);
+  while (stop && *stop == ' ') stop++;
+  if (!stop || *stop || v < 0 || v > 255) {
+    return -1;
+  }
+  return static_cast<int>(v);
+}
+
+// persist.ichthys.udfps_sep_keep -> separator alpha, as SystemUI computes it (udfpsSeparatorAlpha):
+// keep in 0.5..1 (unset / invalid = 0.94), alpha = max(1, round((1 - keep) * 255)).
+int UdfpsSepAlpha(const std::string &value) {
+  double keep = 0.94;
+  const char *s = value.c_str();
+  char *stop = nullptr;
+  double v = strtod(s, &stop);
+  if (stop != s && !*stop && std::isfinite(v)) {
+    keep = std::max(0.5, std::min(1.0, v));
+  }
+  return std::max(1, static_cast<int>(lround((1.0 - keep) * 255.0)));
+}
+
+// Total gain A and exponent p of channel ch (0 = r, 1 = g, 2 = b) at the panel level.
+void UdfpsModelShape(const double *params, int ch, double level, double *gain, double *expo) {
+  const double *q = params + 4 * ch;
+  double ln_l = log(std::max(1.0, std::min(486.0, level)));
+  *gain = std::max(0.01, std::min(4.0, exp(q[0] + q[1] * ln_l)));
+  *expo = std::max(0.6, std::min(1.6, q[2] + q[3] * ln_l));
+}
+
+// The 1024-entry GC curve per DRM component for the panel level and separator alpha.
+void BuildUdfpsModelTable(const double *params, double level, int alpha,
+                          uint16_t (*out)[kUdfpsLutEntries]) {
+  double keep = std::max(0.02, 1.0 - std::max(0, std::min(255, alpha)) / 255.0);
+  double knee = std::min(1.0, keep + 2.0 / 1023.0);
+  for (int c = 0; c < 3; c++) {
+    double gain = 1.0;
+    double expo = 1.0;
+    UdfpsModelShape(params, kUdfpsModelChannel[c], level, &gain, &expo);
+    double y_top = std::min(1.0, gain * pow(knee / keep, expo));
+    for (int i = 0; i < kUdfpsLutEntries; i++) {
+      double x = i / 1023.0;
+      double y;
+      if (x <= knee) {
+        y = std::min(1.0, gain * pow(x / keep, expo));
+      } else {
+        y = y_top + (x - knee) * (1.0 - y_top) / std::max(1e-6, 1.0 - knee);
+      }
+      y = std::max(0.0, std::min(1.0, y));
+      out[c][i] = static_cast<uint16_t>(std::min(1023.0, floor(y * 1023.0 + 0.5)));
+    }
+  }
+}
+// UDFPS_MODEL_MATH_END
+
 // Re-reads the calibration table when any of its props changed. Returns true when it did (the
 // curve must then be rebuilt).
 bool PollUdfpsLut() {
@@ -1803,6 +1948,7 @@ bool PollUdfpsLut() {
     }
   }
   changed |= PollUdfpsProp(&t.bl_prop, kUdfpsLutBlProp);
+  changed |= PollUdfpsProp(&t.model_prop, kUdfpsModelProp);
   if (!changed) {
     return false;
   }
@@ -1834,6 +1980,12 @@ bool PollUdfpsLut() {
     level[0] = 0.0f;
   }
   int prev_points = t.num_points;
+  bool prev_model = t.model_valid && !t.knots_present;
+  t.knots_present = false;
+  for (int p = 0; p < kUdfpsLutPoints; p++) {
+    t.knots_present |= curve_ok[p];
+  }
+  t.model_valid = ParseUdfpsModel(ReadUdfpsProp(t.model_prop), t.model);
   t.num_points = n;
   for (int i = 0; i < n; i++) {
     t.level[i] = level[order[i]];
@@ -1842,7 +1994,12 @@ bool PollUdfpsLut() {
   t.fallback_level = (n > 0 && curve_ok[0] && has_level[0]) ? level[0] : (n > 0 ? t.level[0] : 0.0f);
   t.built = false;
   if (n == 0) {
-    if (prev_points > 0) {
+    if (t.model_valid && !t.knots_present) {
+      const double *m = t.model;
+      DLOGI("IchthysOS udfps_lut: parametric model loaded, r %.3f %.3f %.3f %.3f g %.3f %.3f %.3f "
+            "%.3f b %.3f %.3f %.3f %.3f", m[0], m[1], m[2], m[3], m[4], m[5], m[6], m[7], m[8],
+            m[9], m[10], m[11]);
+    } else if (prev_points > 0 || prev_model) {
       DLOGI("IchthysOS udfps_lut: curve invalid or unset, off");
     }
   } else if (n == 1) {
@@ -1912,6 +2069,54 @@ bool BuildUdfpsLut(float bl) {
   return true;
 }
 
+// IchthysOS: the separator alpha for the model curve; *published = it came from SystemUI. One
+// atomic load per call while no property changed.
+int PollUdfpsSepAlpha(bool *published) {
+  IchthysUdfpsAlpha &a = g_udfps_alpha;
+  uint32_t area_serial = __system_property_area_serial();
+  if (!a.polled || area_serial != a.area_serial) {
+    bool first = !a.polled;
+    a.polled = true;
+    a.area_serial = area_serial;
+    if (PollUdfpsProp(&a.applied_prop, kUdfpsAlphaProp)) {
+      a.applied = ParseUdfpsAlpha(ReadUdfpsProp(a.applied_prop));
+    }
+    if (PollUdfpsProp(&a.keep_prop, kUdfpsSepKeepProp) || first) {
+      a.fallback = UdfpsSepAlpha(ReadUdfpsProp(a.keep_prop));
+    }
+  }
+  *published = a.applied >= 0;
+  return *published ? a.applied : a.fallback;
+}
+
+// IchthysOS: builds g_udfps_lut.lut from the parametric model for the panel level (sysfs units,
+// < 0 = unknown: no curve) and separator alpha. Returns true when the curve content may have
+// changed.
+bool BuildUdfpsModelLut(float level, int alpha, bool published) {
+  IchthysUdfpsLut &t = g_udfps_lut;
+  if (level < 0.0f) {
+    bool was_valid = t.valid;
+    t.valid = false;
+    return was_valid;
+  }
+  if (t.built && t.valid && level == t.built_level && alpha == t.built_alpha) {
+    return false;
+  }
+  BuildUdfpsModelTable(t.model, level, alpha, t.lut);
+  double gain[3] = {};
+  double expo[3] = {};
+  for (int ch = 0; ch < 3; ch++) {
+    UdfpsModelShape(t.model, ch, level, &gain[ch], &expo[ch]);
+  }
+  DLOGI("IchthysOS udfps_lut: model curve for panel level %.0f, separator alpha %d (%s): A r/g/b "
+        "%.3f/%.3f/%.3f, p %.3f/%.3f/%.3f", level, alpha, published ? "SystemUI" : "sep_keep",
+        gain[0], gain[1], gain[2], expo[0], expo[1], expo[2]);
+  t.valid = t.built = true;
+  t.built_level = level;
+  t.built_alpha = alpha;
+  return true;
+}
+
 }  // namespace
 #endif  // UDFPS_ZPOS && PP_DRM_ENABLE
 
@@ -1951,6 +2156,12 @@ void *HWDeviceDRM::BuildFingerprintLutPgc(bool mask_curve) {
   }
   drm_msm_pgc_lut *out = new drm_msm_pgc_lut();
   out->flags = have_base ? udfps_pgc_base_flags_ : 0;
+  if (mask_curve) {
+    // IchthysOS: the mask curve does the dark end in 10 bits, so the GC must not round its output
+    // to 8 bits (GC_8B_ROUND_EN); the PP dither after the DSPP takes it to the panel's 8 bpc. The
+    // colour manager never sets the flag today (GetDrmPGC: flags 0), this only makes it certain.
+    out->flags &= ~static_cast<uint64_t>(PGC_8B_ROUND);
+  }
   uint32_t *dst[3] = {out->c0, out->c1, out->c2};
   for (int c = 0; c < 3; c++) {
     uint16_t entry[2];
@@ -1998,6 +2209,16 @@ float HWDeviceDRM::GetUdfpsBrightness() {
   return 1.0f + 254.0f * std::max(0.0f, std::min(1.0f, f));
 }
 
+// IchthysOS: the panel's raw backlight level (same node as GetUdfpsBrightness, 0..max_brightness
+// = 486 here) for the parametric mask curve model. Returns -1 when unreadable.
+int HWDeviceDRM::GetUdfpsPanelLevel() {
+  int level = 0;
+  if (GetPanelBrightness(&level) != kErrorNone) {
+    return -1;
+  }
+  return std::max(0, level);
+}
+
 // IchthysOS: puts the wanted GC (mask curve while the mask layer is shown and a valid curve is
 // set, else the colour mode's own GC) into the request on changes only. Commit path only.
 // mask_on_edge = first frame of a mask: with several calibration points the brightness is read
@@ -2008,16 +2229,34 @@ void HWDeviceDRM::SetupFingerprintLut(bool fod_present, bool mask_on_edge) {
   bool want = false;
   if (fod_present) {
     bool table_changed = PollUdfpsLut();
-    float bl = g_udfps_lut.built_level;
-    if (g_udfps_lut.num_points >= 2 &&
-        (mask_on_edge || table_changed || !g_udfps_lut.built)) {
-      bl = GetUdfpsBrightness();
-      if (bl < 0.0f) {
-        bl = g_udfps_lut.built ? g_udfps_lut.built_level : g_udfps_lut.fallback_level;
-        DLOGW("IchthysOS udfps_lut: brightness unreadable, using %.1f", bl);
+    if (!g_udfps_lut.knots_present && g_udfps_lut.model_valid) {
+      // IchthysOS: parametric model (no knot point set). The panel level is read at mask-on (and
+      // when the props change); unreadable keeps the last level, or no curve if there is none.
+      float level = g_udfps_lut.built ? g_udfps_lut.built_level : -1.0f;
+      if (mask_on_edge || table_changed || !g_udfps_lut.built) {
+        int raw = GetUdfpsPanelLevel();
+        if (raw >= 0) {
+          level = FLOAT(raw);
+        } else if (mask_on_edge || table_changed) {
+          DLOGW("IchthysOS udfps_lut: panel level unreadable, %s",
+                level >= 0.0f ? "keeping the last one" : "no model curve");
+        }
       }
+      bool published = false;
+      int alpha = PollUdfpsSepAlpha(&published);
+      curve_changed = BuildUdfpsModelLut(level, alpha, published);
+    } else {
+      float bl = g_udfps_lut.built_level;
+      if (g_udfps_lut.num_points >= 2 &&
+          (mask_on_edge || table_changed || !g_udfps_lut.built)) {
+        bl = GetUdfpsBrightness();
+        if (bl < 0.0f) {
+          bl = g_udfps_lut.built ? g_udfps_lut.built_level : g_udfps_lut.fallback_level;
+          DLOGW("IchthysOS udfps_lut: brightness unreadable, using %.1f", bl);
+        }
+      }
+      curve_changed = BuildUdfpsLut(bl);
     }
-    curve_changed = BuildUdfpsLut(bl);
     want = g_udfps_lut.valid;
   }
   if (want == udfps_lut_applied_ && !udfps_lut_resend_ && !(want && curve_changed)) {
