@@ -1732,14 +1732,18 @@ void HWDeviceDRM::SetupFingerprintMask(const HWLayersInfo &hw_layer_info, bool v
 //
 // IchthysOS: physics curve, the DEFAULT when no knot point is complete and no valid
 // persist.ichthys.udfps_model is set (persist.ichthys.udfps_physics = 0 / false / off / n / no
-// turns it off: no curve, as before). No calibration: per channel
-//   A_c = w_c * (cd(L) / cd(M))^(1 / gamma),  p = 1,  same curve and separator as the model
+// turns it off: no curve, as before). No calibration of A: per channel
+//   A_c = w_c * (cd(L) / cd(M))^(1 / gamma),  same curve and separator as the model, with
+//   p(L) = clamp(p0 + p1 * ln L, 0.6, 1.0)   (L clamped to 1..486)
+// p < 1 lifts the dark tones at low brightness (measured: ~0.90 at L 14, ~0.96 at L 41).
 // cd = the panel's candela per backlight level (kUdfpsCandela, from the kernel DT), L = the panel
 // level at mask-on, M = max(mask level, L): the mask level is the one sent in fingerprint_mask
 // (persist.ichthys.udfps_mask_level, else 331 = 547 nits) and the kernel drives max(mask, normal)
 // while the mask is on, so L >= M gives A = w (only the separator undone).
 // gamma: persist.ichthys.udfps_gamma (1..4, default 2.2); w: persist.ichthys.udfps_wb "r g b"
-// (each 0.25..2, default "1 1 1"). Invalid values = the defaults.
+// (each 0.25..2, default "1 1 1"); persist.ichthys.udfps_pexp = "p0 p1" (two plain decimals,
+// |v| <= 100, default "0.787 0.0466": p = 0.91 at L 14, 0.96 at L 41, 1 from L 97 up). Invalid
+// values = the defaults.
 // Precedence: complete knot point > persist.ichthys.udfps_model > physics; SystemUI uses the
 // separator dim under the same rule (UdfpsController.isUdfpsHalCurveActive), sync mode only.
 namespace {
@@ -1763,6 +1767,7 @@ const char *const kUdfpsSepKeepProp = "persist.ichthys.udfps_sep_keep";
 const char *const kUdfpsPhysicsProp = "persist.ichthys.udfps_physics";
 const char *const kUdfpsGammaProp = "persist.ichthys.udfps_gamma";
 const char *const kUdfpsWbProp = "persist.ichthys.udfps_wb";
+const char *const kUdfpsPexpProp = "persist.ichthys.udfps_pexp";
 constexpr int kUdfpsModelParams = 12;
 constexpr int kUdfpsLevels = 487;  // panel backlight levels 0..486
 constexpr int kUdfpsDefaultMaskLevel = 331;  // the kernel's fingerprint_mask = 1 level
@@ -1791,9 +1796,11 @@ struct IchthysUdfpsLut {
   IchthysUdfpsProp physics_prop;
   IchthysUdfpsProp gamma_prop;
   IchthysUdfpsProp wb_prop;
+  IchthysUdfpsProp pexp_prop;
   bool physics = true;
   double gamma = 2.2;
   double wb[3] = {1.0, 1.0, 1.0};
+  double pexp[2] = {0.787, 0.0466};  // p(L) = p0 + p1 * ln L
   // The expanded curve last built and the brightness (model / physics: panel level, alpha and
   // mask level) it was built for.
   bool built = false;
@@ -1922,7 +1929,24 @@ bool UdfpsModelSep(char c) {
   return c == ' ' || c == ',' || c == '\t';
 }
 
-// "a0r a1r p0r p1r a0g ... p1b" -> params[12]; false unless exactly 12 finite numbers.
+// strtod limited to plain decimals ([+-] digits [. digits] [e [+-] digits], also ".5" / "5."),
+// exactly what SystemUI's isUdfpsModelValid accepts: false for no number, hex, inf / nan or
+// leading whitespace. *stop as strtod.
+bool UdfpsStrtodPlain(const char *s, char **stop, double *v) {
+  *v = strtod(s, stop);
+  if (*stop == s) {
+    return false;
+  }
+  for (const char *c = s; c < *stop; c++) {
+    if (!((*c >= '0' && *c <= '9') || *c == '+' || *c == '-' || *c == '.' || *c == 'e' ||
+          *c == 'E')) {
+      return false;
+    }
+  }
+  return true;
+}
+
+// "a0r a1r p0r p1r a0g ... p1b" -> params[12]; false unless exactly 12 finite plain decimals.
 bool ParseUdfpsModel(const std::string &value, double *params) {
   const char *s = value.c_str();
   int n = 0;
@@ -1935,8 +1959,9 @@ bool ParseUdfpsModel(const std::string &value, double *params) {
       return false;
     }
     char *stop = nullptr;
-    double v = strtod(s, &stop);
-    if (stop == s || (*stop && !UdfpsModelSep(*stop)) || !std::isfinite(v) || fabs(v) > 100.0) {
+    double v = 0.0;
+    if (!UdfpsStrtodPlain(s, &stop, &v) || (*stop && !UdfpsModelSep(*stop)) ||
+        !std::isfinite(v) || fabs(v) > 100.0) {
       return false;
     }
     params[n++] = v;
@@ -2095,6 +2120,39 @@ void ParseUdfpsWb(const std::string &value, double *wb) {
   }
 }
 
+// persist.ichthys.udfps_pexp "p0 p1": two plain decimals (|v| <= 100, separated like the model),
+// else 0.787 0.0466.
+void ParseUdfpsPexp(const std::string &value, double *pexp) {
+  double v[2] = {0.0, 0.0};
+  const char *s = value.c_str();
+  int n = 0;
+  bool ok = true;
+  for (;;) {
+    while (UdfpsModelSep(*s)) s++;
+    if (!*s) {
+      break;
+    }
+    char *stop = nullptr;
+    double x = 0.0;
+    if (n == 2 || !UdfpsStrtodPlain(s, &stop, &x) || (*stop && !UdfpsModelSep(*stop)) ||
+        !std::isfinite(x) || fabs(x) > 100.0) {
+      ok = false;
+      break;
+    }
+    v[n++] = x;
+    s = stop;
+  }
+  bool use = ok && n == 2;
+  pexp[0] = use ? v[0] : 0.787;
+  pexp[1] = use ? v[1] : 0.0466;
+}
+
+// The physics exponent p(L) = clamp(p0 + p1 * ln L, 0.6, 1.0).
+double UdfpsPhysicsExpo(double level, const double *pexp) {
+  double ln_l = log(std::max(1.0, std::min(486.0, level)));
+  return std::max(0.6, std::min(1.0, pexp[0] + pexp[1] * ln_l));
+}
+
 // (cd(L) / cd(M))^(1 / gamma), M = max(mask level, L).
 double UdfpsPhysicsBase(double level, int mask_level, double gamma) {
   int l = std::max(0, std::min(kUdfpsLevels - 1, static_cast<int>(level)));
@@ -2104,10 +2162,11 @@ double UdfpsPhysicsBase(double level, int mask_level, double gamma) {
 
 // The physics GC curve per DRM component (wb in r, g, b order).
 void BuildUdfpsPhysicsTable(double level, int mask_level, double gamma, const double *wb,
-                            int alpha, uint16_t (*out)[kUdfpsLutEntries]) {
+                            const double *pexp, int alpha, uint16_t (*out)[kUdfpsLutEntries]) {
   double base = UdfpsPhysicsBase(level, mask_level, gamma);
+  double expo = UdfpsPhysicsExpo(level, pexp);
   for (int c = 0; c < 3; c++) {
-    BuildUdfpsCurve(wb[kUdfpsModelChannel[c]] * base, 1.0, alpha, out[c]);
+    BuildUdfpsCurve(wb[kUdfpsModelChannel[c]] * base, expo, alpha, out[c]);
   }
 }
 // UDFPS_MODEL_MATH_END
@@ -2133,6 +2192,7 @@ bool PollUdfpsLut() {
   changed |= PollUdfpsProp(&t.physics_prop, kUdfpsPhysicsProp);
   changed |= PollUdfpsProp(&t.gamma_prop, kUdfpsGammaProp);
   changed |= PollUdfpsProp(&t.wb_prop, kUdfpsWbProp);
+  changed |= PollUdfpsProp(&t.pexp_prop, kUdfpsPexpProp);
   if (!changed) {
     return false;  // (no prop at all: the struct defaults are the physics defaults)
   }
@@ -2173,6 +2233,7 @@ bool PollUdfpsLut() {
   t.physics = UdfpsPhysicsEnabled(ReadUdfpsProp(t.physics_prop));
   t.gamma = ParseUdfpsGamma(ReadUdfpsProp(t.gamma_prop));
   ParseUdfpsWb(ReadUdfpsProp(t.wb_prop), t.wb);
+  ParseUdfpsPexp(ReadUdfpsProp(t.pexp_prop), t.pexp);
   t.num_points = n;
   for (int i = 0; i < n; i++) {
     t.level[i] = level[order[i]];
@@ -2187,8 +2248,8 @@ bool PollUdfpsLut() {
             "%.3f b %.3f %.3f %.3f %.3f", m[0], m[1], m[2], m[3], m[4], m[5], m[6], m[7], m[8],
             m[9], m[10], m[11]);
     } else if (t.physics && !t.knots_present) {
-      DLOGI("IchthysOS udfps_lut: physics curve, gamma %.3f, wb r/g/b %.3f/%.3f/%.3f", t.gamma,
-            t.wb[0], t.wb[1], t.wb[2]);
+      DLOGI("IchthysOS udfps_lut: physics curve, gamma %.3f, wb r/g/b %.3f/%.3f/%.3f, "
+            "p0 %.4f p1 %.4f", t.gamma, t.wb[0], t.wb[1], t.wb[2], t.pexp[0], t.pexp[1]);
     } else if (prev_points > 0 || prev_auto) {
       DLOGI("IchthysOS udfps_lut: curve invalid or unset, off");
     }
@@ -2298,15 +2359,17 @@ bool BuildUdfpsAutoLut(float level, int alpha, bool published, int mask_level) {
   t.built_alpha = alpha;
   t.built_mask = mask_level;
   if (!t.model_valid) {
-    BuildUdfpsPhysicsTable(level, mask_level, t.gamma, t.wb, alpha, t.lut);
+    BuildUdfpsPhysicsTable(level, mask_level, t.gamma, t.wb, t.pexp, alpha, t.lut);
     int l = std::max(0, std::min(kUdfpsLevels - 1, static_cast<int>(level)));
     int m = std::max(l, std::max(0, std::min(kUdfpsLevels - 1, mask_level)));
     double base = UdfpsPhysicsBase(level, mask_level, t.gamma);
     int cd_l = kUdfpsCandela[l];
     int cd_m = kUdfpsCandela[m];
+    double expo = UdfpsPhysicsExpo(level, t.pexp);
     DLOGI("IchthysOS udfps_lut: physics curve for panel level %d (%d cd) under mask level %d "
-          "(%d cd), separator alpha %d (%s): A r/g/b %.3f/%.3f/%.3f", l, cd_l, m, cd_m, alpha,
-          published ? "SystemUI" : "sep_keep", t.wb[0] * base, t.wb[1] * base, t.wb[2] * base);
+          "(%d cd), separator alpha %d (%s): A r/g/b %.3f/%.3f/%.3f, p %.3f", l, cd_l, m, cd_m,
+          alpha, published ? "SystemUI" : "sep_keep", t.wb[0] * base, t.wb[1] * base,
+          t.wb[2] * base, expo);
     return true;
   }
   BuildUdfpsModelTable(t.model, level, alpha, t.lut);
