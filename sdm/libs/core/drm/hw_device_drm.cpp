@@ -1702,7 +1702,7 @@ void HWDeviceDRM::SetupFingerprintMask(const HWLayersInfo &hw_layer_info, bool v
 //
 // IchthysOS: parametric, automatically brightness-dependent curve. Used only when NO knot point
 // above has all three props valid (knot props keep precedence; SystemUI applies the same rule).
-// In this mode the dim window is only a separator (default alpha 1, keep = 254/255, i.e. no
+// In this mode the dim window is only a separator (default alpha 3, keep = 252/255, i.e. no
 // visible dim) so the content's codes stay <= 255 * keep and the illumination disc (code 255) can
 // be told apart; the curve does ALL the darkening plus the colour / tone correction, at the GC's
 // full 10-bit output.
@@ -1712,21 +1712,26 @@ void HWDeviceDRM::SetupFingerprintMask(const HWLayersInfo &hw_layer_info, bool v
 //   A_c = clamp(exp(a0_c + a1_c * ln L), 0.01, 4)     p_c = clamp(p0_c + p1_c * ln L, 0.6, 1.6)
 // A_c is the TOTAL factor (normal-mode look of a content level, expressed in mask-HBM codes), not
 // relative to any dim. With keep = 1 - alpha / 255 (the separator) and x = i / 1023:
-//   knee = min(1022 / 1023, keep + 1 / 1023)   full = max(knee, 1020 / 1023)
+//   knee = min(1019.5 / 1023, keep + 5.5 / 1023)   full = max(knee, 1020 / 1023)
 //   x <= knee:         g(x) = min(1, A_c * (x / keep)^p_c)                 (content)
 //   knee < x < full:   g(x) = g_top + (x - knee) * (1 - g_top) / (full - knee),  g_top = g(knee)
 //   x >= full:         g(x) = 1                                            (the disc)
 //   gc[i] = clamp(floor(g(x) * 1023 + 0.5), 0, 1023)     (double precision; keep >= 0.02)
-// The top content code is 255 * keep (8-bit client composition: 254 at alpha 1) or 1023 * keep
-// (device blending); expanded to 10 bits it is at most 1023 * keep + 0.8 (bit replication,
-// 254 -> 1019), so it stays at or below the knee. The disc is 255, which the 8 -> 10-bit expansion
-// makes 1023 (replication) or 1020 (shift), so everything from 1020 up is full light.
+// The top content code is 255 * keep (8-bit client composition: 252 at alpha 3) or 1023 * keep
+// (device blending), and dimmed white can land one 8-bit step higher (253 at alpha 3; at alpha 1
+// that step is the disc code 255, measured: white UI flared to full HBM). An 8-bit code c reaches
+// the GC as 4c (shift) .. 4c + 3 (bit replication), so content incl. that step is below
+// 1023 * keep + 5 for every keep >= 0.5 (alpha 3: 253 -> 1012..1015, 1023 * keep = 1011): the knee
+// 5.5 codes above 1023 * keep keeps it on the content curve (alpha 3: codes <= 1016 content,
+// 1017..1019 ramp). The disc is 255, which the 8 -> 10-bit expansion makes 1023 (replication) or
+// 1020 (shift); the knee never passes 1019.5, so everything from 1020 up is full light (alpha 1 / 2:
+// the knee is that cap, no ramp codes).
 // udfps_lut_ref.py model_table() is the reference implementation. Identity tone with only the
 // separator undone: "0 0 1 0" per channel.
 // keep: ichthys.udfps_applied_alpha (0..255), published by SystemUI right before it adds the mask
 // window, i.e. the separator that frame really carries (Settings.Global ichthys_udfps_sep_alpha
 // overrides included). Unset / invalid (older SystemUI): persist.ichthys.udfps_sep_keep, the
-// separator SystemUI uses by default (0.5..1, default 254 / 255):
+// separator SystemUI uses by default (0.5..1, default 252 / 255):
 //   alpha = max(1, round((1 - keep) * 255)).
 // Both alpha props are polled every mask frame (a changed separator rebuilds the curve).
 //
@@ -1744,6 +1749,12 @@ void HWDeviceDRM::SetupFingerprintMask(const HWLayersInfo &hw_layer_info, bool v
 // (each 0.25..2, default "1 1 1"); persist.ichthys.udfps_pexp = "p0 p1" (two plain decimals,
 // |v| <= 100, default "0.787 0.0466": p = 0.91 at L 14, 0.96 at L 41, 1 from L 97 up). Invalid
 // values = the defaults.
+// Toe (physics only): under the mask HBM the panel's darkest codes emit too little light (green
+// most, then blue, red barely), so the content branch's y (0..1 output units, before the 10-bit
+// rounding) becomes y' = min(1, y + t_c * max(0, 1 - y / c1)) for y > 0 (y = 0 stays 0), with
+// t_c = min(t_c, c1 / 2) so the curve stays increasing (slope 1 - t_c / c1 >= 1 / 2 below c1).
+// persist.ichthys.udfps_toe = "tr tg tb" (plain decimals 0..0.05 each, default "0 0 0" = off),
+// persist.ichthys.udfps_toe_knee = c1 (plain decimal 0.02..0.5, default 0.1). Invalid = defaults.
 // Precedence: complete knot point > persist.ichthys.udfps_model > physics; SystemUI uses the
 // separator dim under the same rule (UdfpsController.isUdfpsHalCurveActive), sync mode only.
 namespace {
@@ -1768,6 +1779,8 @@ const char *const kUdfpsPhysicsProp = "persist.ichthys.udfps_physics";
 const char *const kUdfpsGammaProp = "persist.ichthys.udfps_gamma";
 const char *const kUdfpsWbProp = "persist.ichthys.udfps_wb";
 const char *const kUdfpsPexpProp = "persist.ichthys.udfps_pexp";
+const char *const kUdfpsToeProp = "persist.ichthys.udfps_toe";
+const char *const kUdfpsToeKneeProp = "persist.ichthys.udfps_toe_knee";
 constexpr int kUdfpsModelParams = 12;
 constexpr int kUdfpsLevels = 487;  // panel backlight levels 0..486
 constexpr int kUdfpsDefaultMaskLevel = 331;  // the kernel's fingerprint_mask = 1 level
@@ -1797,10 +1810,14 @@ struct IchthysUdfpsLut {
   IchthysUdfpsProp gamma_prop;
   IchthysUdfpsProp wb_prop;
   IchthysUdfpsProp pexp_prop;
+  IchthysUdfpsProp toe_prop;
+  IchthysUdfpsProp toe_knee_prop;
   bool physics = true;
   double gamma = 2.2;
   double wb[3] = {1.0, 1.0, 1.0};
   double pexp[2] = {0.787, 0.0466};  // p(L) = p0 + p1 * ln L
+  double toe[3] = {0.0, 0.0, 0.0};   // r, g, b
+  double toe_knee = 0.1;
   // The expanded curve last built and the brightness (model / physics: panel level, alpha and
   // mask level) it was built for.
   bool built = false;
@@ -1987,9 +2004,9 @@ int ParseUdfpsAlpha(const std::string &value) {
 }
 
 // persist.ichthys.udfps_sep_keep -> separator alpha, as SystemUI computes it (udfpsSeparatorAlpha):
-// keep in 0.5..1 (unset / invalid = 254 / 255), alpha = max(1, round((1 - keep) * 255)).
+// keep in 0.5..1 (unset / invalid = 252 / 255), alpha = max(1, round((1 - keep) * 255)).
 int UdfpsSepAlpha(const std::string &value) {
-  double keep = 254.0 / 255.0;
+  double keep = 252.0 / 255.0;  // IchthysOS: 3 steps; 1 let white content round onto the disc ramp
   const char *s = value.c_str();
   char *stop = nullptr;
   double v = strtod(s, &stop);
@@ -2007,17 +2024,27 @@ void UdfpsModelShape(const double *params, int ch, double level, double *gain, d
   *expo = std::max(0.6, std::min(1.6, q[2] + q[3] * ln_l));
 }
 
-// One channel's 1024-entry GC curve: total gain and exponent below the knee, ramp to the disc.
-void BuildUdfpsCurve(double gain, double expo, int alpha, uint16_t *out) {
+// The physics toe lift of a content output y (0..1): y = 0 (and toe <= 0) unchanged.
+double UdfpsToe(double y, double toe, double toe_knee) {
+  if (!(y > 0.0) || !(toe > 0.0)) {
+    return y;
+  }
+  return std::min(1.0, y + toe * std::max(0.0, 1.0 - y / toe_knee));
+}
+
+// One channel's 1024-entry GC curve: total gain and exponent below the knee (then the toe, 0 =
+// none), ramp to the disc.
+void BuildUdfpsCurve(double gain, double expo, int alpha, double toe, double toe_knee,
+                     uint16_t *out) {
   double keep = std::max(0.02, 1.0 - std::max(0, std::min(255, alpha)) / 255.0);
-  double knee = std::min(1022.0 / 1023.0, keep + 1.0 / 1023.0);
+  double knee = std::min(1019.5 / 1023.0, keep + 5.5 / 1023.0);
   double full = std::max(knee, 1020.0 / 1023.0);
-  double y_top = std::min(1.0, gain * pow(knee / keep, expo));
+  double y_top = UdfpsToe(std::min(1.0, gain * pow(knee / keep, expo)), toe, toe_knee);
   for (int i = 0; i < kUdfpsLutEntries; i++) {
     double x = i / 1023.0;
     double y;
     if (x <= knee) {
-      y = std::min(1.0, gain * pow(x / keep, expo));
+      y = UdfpsToe(std::min(1.0, gain * pow(x / keep, expo)), toe, toe_knee);
     } else if (x >= full) {
       y = 1.0;
     } else {
@@ -2035,7 +2062,7 @@ void BuildUdfpsModelTable(const double *params, double level, int alpha,
     double gain = 1.0;
     double expo = 1.0;
     UdfpsModelShape(params, kUdfpsModelChannel[c], level, &gain, &expo);
-    BuildUdfpsCurve(gain, expo, alpha, out[c]);
+    BuildUdfpsCurve(gain, expo, alpha, 0.0, 0.1, out[c]);
   }
 }
 
@@ -2147,6 +2174,52 @@ void ParseUdfpsPexp(const std::string &value, double *pexp) {
   pexp[1] = use ? v[1] : 0.0466;
 }
 
+// "v0 .. v(n-1)": exactly n (<= 3) plain decimals in lo..hi, separated like the model, else false.
+bool ParseUdfpsPlainList(const std::string &value, int n_want, double lo, double hi, double *out) {
+  double v[3] = {};
+  const char *s = value.c_str();
+  int n = 0;
+  for (;;) {
+    while (UdfpsModelSep(*s)) s++;
+    if (!*s) {
+      break;
+    }
+    char *stop = nullptr;
+    double x = 0.0;
+    if (n == n_want || n == 3 || !UdfpsStrtodPlain(s, &stop, &x) ||
+        (*stop && !UdfpsModelSep(*stop)) || !(x >= lo && x <= hi)) {
+      return false;
+    }
+    v[n++] = x;
+    s = stop;
+  }
+  if (n != n_want) {
+    return false;
+  }
+  for (int i = 0; i < n; i++) {
+    out[i] = v[i];
+  }
+  return true;
+}
+
+// persist.ichthys.udfps_toe "tr tg tb": three plain decimals 0..0.05, else 0 0 0 (off).
+void ParseUdfpsToe(const std::string &value, double *toe) {
+  if (!ParseUdfpsPlainList(value, 3, 0.0, 0.05, toe)) {
+    toe[0] = toe[1] = toe[2] = 0.0;
+  }
+}
+
+// persist.ichthys.udfps_toe_knee: one plain decimal 0.02..0.5, else 0.1.
+double ParseUdfpsToeKnee(const std::string &value) {
+  double v = 0.1;
+  return ParseUdfpsPlainList(value, 1, 0.02, 0.5, &v) ? v : 0.1;
+}
+
+// The toe actually applied: at most half the toe knee (keeps the curve increasing).
+double UdfpsToeEffective(double toe, double toe_knee) {
+  return std::min(toe, 0.5 * toe_knee);
+}
+
 // The physics exponent p(L) = clamp(p0 + p1 * ln L, 0.6, 1.0).
 double UdfpsPhysicsExpo(double level, const double *pexp) {
   double ln_l = log(std::max(1.0, std::min(486.0, level)));
@@ -2160,13 +2233,16 @@ double UdfpsPhysicsBase(double level, int mask_level, double gamma) {
   return pow(static_cast<double>(kUdfpsCandela[l]) / kUdfpsCandela[m], 1.0 / gamma);
 }
 
-// The physics GC curve per DRM component (wb in r, g, b order).
+// The physics GC curve per DRM component (wb and toe in r, g, b order).
 void BuildUdfpsPhysicsTable(double level, int mask_level, double gamma, const double *wb,
-                            const double *pexp, int alpha, uint16_t (*out)[kUdfpsLutEntries]) {
+                            const double *pexp, const double *toe, double toe_knee, int alpha,
+                            uint16_t (*out)[kUdfpsLutEntries]) {
   double base = UdfpsPhysicsBase(level, mask_level, gamma);
   double expo = UdfpsPhysicsExpo(level, pexp);
   for (int c = 0; c < 3; c++) {
-    BuildUdfpsCurve(wb[kUdfpsModelChannel[c]] * base, expo, alpha, out[c]);
+    int ch = kUdfpsModelChannel[c];
+    BuildUdfpsCurve(wb[ch] * base, expo, alpha, UdfpsToeEffective(toe[ch], toe_knee), toe_knee,
+                    out[c]);
   }
 }
 // UDFPS_MODEL_MATH_END
@@ -2193,6 +2269,8 @@ bool PollUdfpsLut() {
   changed |= PollUdfpsProp(&t.gamma_prop, kUdfpsGammaProp);
   changed |= PollUdfpsProp(&t.wb_prop, kUdfpsWbProp);
   changed |= PollUdfpsProp(&t.pexp_prop, kUdfpsPexpProp);
+  changed |= PollUdfpsProp(&t.toe_prop, kUdfpsToeProp);
+  changed |= PollUdfpsProp(&t.toe_knee_prop, kUdfpsToeKneeProp);
   if (!changed) {
     return false;  // (no prop at all: the struct defaults are the physics defaults)
   }
@@ -2234,6 +2312,8 @@ bool PollUdfpsLut() {
   t.gamma = ParseUdfpsGamma(ReadUdfpsProp(t.gamma_prop));
   ParseUdfpsWb(ReadUdfpsProp(t.wb_prop), t.wb);
   ParseUdfpsPexp(ReadUdfpsProp(t.pexp_prop), t.pexp);
+  ParseUdfpsToe(ReadUdfpsProp(t.toe_prop), t.toe);
+  t.toe_knee = ParseUdfpsToeKnee(ReadUdfpsProp(t.toe_knee_prop));
   t.num_points = n;
   for (int i = 0; i < n; i++) {
     t.level[i] = level[order[i]];
@@ -2249,7 +2329,8 @@ bool PollUdfpsLut() {
             m[9], m[10], m[11]);
     } else if (t.physics && !t.knots_present) {
       DLOGI("IchthysOS udfps_lut: physics curve, gamma %.3f, wb r/g/b %.3f/%.3f/%.3f, "
-            "p0 %.4f p1 %.4f", t.gamma, t.wb[0], t.wb[1], t.wb[2], t.pexp[0], t.pexp[1]);
+            "p0 %.4f p1 %.4f, toe r/g/b %.4f/%.4f/%.4f knee %.3f", t.gamma, t.wb[0], t.wb[1],
+            t.wb[2], t.pexp[0], t.pexp[1], t.toe[0], t.toe[1], t.toe[2], t.toe_knee);
     } else if (prev_points > 0 || prev_auto) {
       DLOGI("IchthysOS udfps_lut: curve invalid or unset, off");
     }
@@ -2359,7 +2440,8 @@ bool BuildUdfpsAutoLut(float level, int alpha, bool published, int mask_level) {
   t.built_alpha = alpha;
   t.built_mask = mask_level;
   if (!t.model_valid) {
-    BuildUdfpsPhysicsTable(level, mask_level, t.gamma, t.wb, t.pexp, alpha, t.lut);
+    BuildUdfpsPhysicsTable(level, mask_level, t.gamma, t.wb, t.pexp, t.toe, t.toe_knee, alpha,
+                           t.lut);
     int l = std::max(0, std::min(kUdfpsLevels - 1, static_cast<int>(level)));
     int m = std::max(l, std::max(0, std::min(kUdfpsLevels - 1, mask_level)));
     double base = UdfpsPhysicsBase(level, mask_level, t.gamma);
@@ -2367,9 +2449,11 @@ bool BuildUdfpsAutoLut(float level, int alpha, bool published, int mask_level) {
     int cd_m = kUdfpsCandela[m];
     double expo = UdfpsPhysicsExpo(level, t.pexp);
     DLOGI("IchthysOS udfps_lut: physics curve for panel level %d (%d cd) under mask level %d "
-          "(%d cd), separator alpha %d (%s): A r/g/b %.3f/%.3f/%.3f, p %.3f", l, cd_l, m, cd_m,
-          alpha, published ? "SystemUI" : "sep_keep", t.wb[0] * base, t.wb[1] * base,
-          t.wb[2] * base, expo);
+          "(%d cd), separator alpha %d (%s): A r/g/b %.3f/%.3f/%.3f, p %.3f, toe r/g/b "
+          "%.4f/%.4f/%.4f knee %.3f", l, cd_l, m, cd_m, alpha, published ? "SystemUI" : "sep_keep",
+          t.wb[0] * base, t.wb[1] * base, t.wb[2] * base, expo,
+          UdfpsToeEffective(t.toe[0], t.toe_knee), UdfpsToeEffective(t.toe[1], t.toe_knee),
+          UdfpsToeEffective(t.toe[2], t.toe_knee), t.toe_knee);
     return true;
   }
   BuildUdfpsModelTable(t.model, level, alpha, t.lut);
