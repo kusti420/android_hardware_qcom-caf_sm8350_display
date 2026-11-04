@@ -1620,7 +1620,8 @@ void HWDeviceDRM::SetupFingerprintMask(const HWLayersInfo &hw_layer_info, bool v
     return;
   }
   bool enabled = IchthysUdfpsSyncEnabled();
-  if (!enabled && !fingerprint_mask_ && !udfps_lut_applied_ && !udfps_lut_resend_) {
+  if (!enabled && !fingerprint_mask_ && !udfps_lut_applied_ && !udfps_lut_resend_ &&
+      !udfps_gamut_applied_ && !udfps_gamut_resend_) {
     return;  // switched off and nothing to release: today's behaviour, property untouched
   }
   // SurfaceFlinger flags SystemUI's mask layer (window "UdfpsFodMask") with
@@ -1755,6 +1756,16 @@ void HWDeviceDRM::SetupFingerprintMask(const HWLayersInfo &hw_layer_info, bool v
 // t_c = min(t_c, c1 / 2) so the curve stays increasing (slope 1 - t_c / c1 >= 1 / 2 below c1).
 // persist.ichthys.udfps_toe = "tr tg tb" (plain decimals 0..0.05 each, default "0 0 0" = off),
 // persist.ichthys.udfps_toe_knee = c1 (plain decimal 0.02..0.5, default 0.1). Invalid = defaults.
+// Colour-dependent toe (physics only): the dark-end deficit depends on the other channels (in a
+// grey green needs less toe than green alone / with blue), which a per-channel GC cannot express.
+// persist.ichthys.udfps_toe_alone = "tr tg tb" (like udfps_toe) is the toe of a channel lit alone;
+// udfps_toe stays the grey one. Per colour: t_c = t_grey + (t_alone - t_grey) (1 - s_c),
+// s_c = clamp((x_o1 + x_o2) / (2 x_c), 0, 1). This goes on the DSPP 3D gamut (17x17x17, before
+// the GC), on mask frames in the same request as the GC curve, on a grid dense near black
+// (UdfpsGamutGrid: evenly spaced in the mode GC's output code) onto which the colour mode's own
+// gamut is resampled (tetrahedral; the identity when it has none), and the mode's payload is
+// restored byte for byte afterwards (BuildUdfpsGamutTable).
+// Unset / invalid / equal to udfps_toe (effective values): no gamut is touched at all.
 // Precedence: complete knot point > persist.ichthys.udfps_model > physics; SystemUI uses the
 // separator dim under the same rule (UdfpsController.isUdfpsHalCurveActive), sync mode only.
 namespace {
@@ -1781,6 +1792,7 @@ const char *const kUdfpsWbProp = "persist.ichthys.udfps_wb";
 const char *const kUdfpsPexpProp = "persist.ichthys.udfps_pexp";
 const char *const kUdfpsToeProp = "persist.ichthys.udfps_toe";
 const char *const kUdfpsToeKneeProp = "persist.ichthys.udfps_toe_knee";
+const char *const kUdfpsToeAloneProp = "persist.ichthys.udfps_toe_alone";
 constexpr int kUdfpsModelParams = 12;
 constexpr int kUdfpsLevels = 487;  // panel backlight levels 0..486
 constexpr int kUdfpsDefaultMaskLevel = 331;  // the kernel's fingerprint_mask = 1 level
@@ -1812,12 +1824,15 @@ struct IchthysUdfpsLut {
   IchthysUdfpsProp pexp_prop;
   IchthysUdfpsProp toe_prop;
   IchthysUdfpsProp toe_knee_prop;
+  IchthysUdfpsProp toe_alone_prop;
   bool physics = true;
   double gamma = 2.2;
   double wb[3] = {1.0, 1.0, 1.0};
   double pexp[2] = {0.787, 0.0466};  // p(L) = p0 + p1 * ln L
   double toe[3] = {0.0, 0.0, 0.0};   // r, g, b
   double toe_knee = 0.1;
+  bool toe_alone_set = false;              // persist.ichthys.udfps_toe_alone valid
+  double toe_alone[3] = {0.0, 0.0, 0.0};   // r, g, b
   // The expanded curve last built and the brightness (model / physics: panel level, alpha and
   // mask level) it was built for.
   bool built = false;
@@ -1826,6 +1841,11 @@ struct IchthysUdfpsLut {
   int built_mask = -1;
   bool valid = false;
   uint16_t lut[3][kUdfpsLutEntries] = {};
+  // IchthysOS: the physics shape lut was built from (built_physics false: knots or model), for
+  // the colour-dependent toe on the 3D gamut.
+  bool built_physics = false;
+  double built_gain[3] = {};  // r, g, b
+  double built_expo = 1.0;
 };
 IchthysUdfpsLut g_udfps_lut;
 
@@ -2032,25 +2052,38 @@ double UdfpsToe(double y, double toe, double toe_knee) {
   return std::min(1.0, y + toe * std::max(0.0, 1.0 - y / toe_knee));
 }
 
-// One channel's 1024-entry GC curve: total gain and exponent below the knee (then the toe, 0 =
-// none), ramp to the disc.
+// The separator's keep factor and the content knee (normalised input) for a separator alpha.
+double UdfpsKeep(int alpha) {
+  return std::max(0.02, 1.0 - std::max(0, std::min(255, alpha)) / 255.0);
+}
+
+double UdfpsKnee(double keep) {
+  return std::min(1019.5 / 1023.0, keep + 5.5 / 1023.0);
+}
+
+// One channel's curve at normalised input x (0..1), before the 10-bit rounding: total gain and
+// exponent below the knee (then the toe, 0 = none), ramp to the disc.
+double UdfpsCurveValue(double gain, double expo, int alpha, double toe, double toe_knee, double x) {
+  double keep = UdfpsKeep(alpha);
+  double knee = UdfpsKnee(keep);
+  double full = std::max(knee, 1020.0 / 1023.0);
+  double y;
+  if (x <= knee) {
+    y = UdfpsToe(std::min(1.0, gain * pow(x / keep, expo)), toe, toe_knee);
+  } else if (x >= full) {
+    y = 1.0;
+  } else {
+    double y_top = UdfpsToe(std::min(1.0, gain * pow(knee / keep, expo)), toe, toe_knee);
+    y = y_top + (x - knee) * (1.0 - y_top) / (full - knee);
+  }
+  return std::max(0.0, std::min(1.0, y));
+}
+
+// One channel's 1024-entry GC curve (UdfpsCurveValue at x = i / 1023, rounded to 10 bits).
 void BuildUdfpsCurve(double gain, double expo, int alpha, double toe, double toe_knee,
                      uint16_t *out) {
-  double keep = std::max(0.02, 1.0 - std::max(0, std::min(255, alpha)) / 255.0);
-  double knee = std::min(1019.5 / 1023.0, keep + 5.5 / 1023.0);
-  double full = std::max(knee, 1020.0 / 1023.0);
-  double y_top = UdfpsToe(std::min(1.0, gain * pow(knee / keep, expo)), toe, toe_knee);
   for (int i = 0; i < kUdfpsLutEntries; i++) {
-    double x = i / 1023.0;
-    double y;
-    if (x <= knee) {
-      y = UdfpsToe(std::min(1.0, gain * pow(x / keep, expo)), toe, toe_knee);
-    } else if (x >= full) {
-      y = 1.0;
-    } else {
-      y = y_top + (x - knee) * (1.0 - y_top) / (full - knee);
-    }
-    y = std::max(0.0, std::min(1.0, y));
+    double y = UdfpsCurveValue(gain, expo, alpha, toe, toe_knee, i / 1023.0);
     out[i] = static_cast<uint16_t>(std::min(1023.0, floor(y * 1023.0 + 0.5)));
   }
 }
@@ -2215,6 +2248,12 @@ double ParseUdfpsToeKnee(const std::string &value) {
   return ParseUdfpsPlainList(value, 1, 0.02, 0.5, &v) ? v : 0.1;
 }
 
+// persist.ichthys.udfps_toe_alone "tr tg tb": as udfps_toe; false (and toe_alone untouched) when
+// unset or invalid, i.e. a lone channel gets udfps_toe like any other colour.
+bool ParseUdfpsToeAlone(const std::string &value, double *toe_alone) {
+  return ParseUdfpsPlainList(value, 3, 0.0, 0.05, toe_alone);
+}
+
 // The toe actually applied: at most half the toe knee (keeps the curve increasing).
 double UdfpsToeEffective(double toe, double toe_knee) {
   return std::min(toe, 0.5 * toe_knee);
@@ -2245,6 +2284,223 @@ void BuildUdfpsPhysicsTable(double level, int mask_level, double gamma, const do
                     out[c]);
   }
 }
+
+// IchthysOS: colour-dependent toe on the DSPP 3D gamut (SDE GAMUT v4.3, CRTC property
+// "SDE_DSPP_GAMUT_V4", struct drm_msm_3d_gamut, 17x17x17 nodes, 12-bit). The gamut sits after
+// IGC / PCC and before the GC, so its node outputs are what the GC (the colour mode's GC with the
+// mask curve composed on it) receives. Node n = r + 17 g + 289 b (r index fastest) is entry n / 4
+// of table n % 4 (GAMUT_3D_MODE17_TBL_SZ 1229 = ceil(4913 / 4); LUTBUS sends the tables
+// interleaved, i.e. in node order), output r in c0, g in c2_c1 bits 16..27, b in bits 0..11 -
+// the vendor's packing (libsdm-color.so ConvertGamutHelper<lut3d_info>: QDCM nodes sorted by
+// b, g, r, c0 = out.r, c2_c1 = out.g << 16 | out.b).
+constexpr int kUdfpsGamutDim = 17;
+constexpr int kUdfpsGamutNodes = kUdfpsGamutDim * kUdfpsGamutDim * kUdfpsGamutDim;  // 4913
+constexpr int kUdfpsGamutTables = 4;
+constexpr int kUdfpsGamutTableLen = 1229;
+// Channel (r, g, b) -> DRM GC component (c0 = G, c1 = B, c2 = R).
+constexpr int kUdfpsGcComponent[3] = {2, 0, 1};
+
+int UdfpsGamutTable(int n) {
+  return n % kUdfpsGamutTables;
+}
+
+int UdfpsGamutEntry(int n) {
+  return n / kUdfpsGamutTables;
+}
+
+// Node positions per axis (r, g, b; 12-bit input, 17 nodes, node 0 = 0, node 16 = 4096). The SDE
+// takes them as 16 scale / offset words per axis (GAMUT_3D_MAP_EN), encoded as the vendor library
+// encodes a QDCM grid: ((2^20 / (p[k + 1] - p[k])) & 0x1ffff) << 12 | (p[k] & 0xfff), steps >= 9.
+void UdfpsGamutScaleOffEncode(const int *pos, uint32_t *words) {
+  for (int k = 0; k < kUdfpsGamutDim - 1; k++) {
+    uint32_t step = static_cast<uint32_t>(std::max(1, pos[k + 1] - pos[k]));
+    words[k] = ((0x100000u / step) & 0x1ffffu) << 12 | (static_cast<uint32_t>(pos[k]) & 0xfffu);
+  }
+}
+
+// The positions back from the words (the last node from the last segment's scale).
+void UdfpsGamutScaleOffDecode(const uint32_t *words, int *pos) {
+  for (int k = 0; k < kUdfpsGamutDim - 1; k++) {
+    pos[k] = static_cast<int>(words[k] & 0xfffu);
+  }
+  uint32_t scale = (words[kUdfpsGamutDim - 2] >> 12) & 0x1ffffu;
+  pos[kUdfpsGamutDim - 1] = pos[kUdfpsGamutDim - 2] +
+      (scale ? static_cast<int>(floor(1048576.0 / scale + 0.5)) : 256);
+}
+
+// The uniform grid (256 k), what the vendor library makes of a uniform QDCM table.
+void UdfpsGamutUniformGrid(int (*pos)[kUdfpsGamutDim]) {
+  for (int ch = 0; ch < 3; ch++) {
+    for (int k = 0; k < kUdfpsGamutDim; k++) {
+      pos[ch][k] = 256 * k;
+    }
+  }
+}
+
+// IchthysOS: the mask-frame grid, dense near black: node k of axis c sits where the colour mode's
+// GC (that channel's; none = identity) first reaches the 10-bit code 64 k, i.e. the nodes are
+// evenly spaced in the code the mask curve and its toe act on. Without a mode GC this is the
+// uniform grid; with the sRGB mode's GC (gamut in linear light after the IGC) the nodes sit at
+// 8-bit content ~0, 18, 33, 49, 65, 81, 97, 113, ... 241, 255 instead of 0, 71, 100, 121, ...
+// Steps are kept >= 9 (the vendor library's minimum) and node 16 = 4096.
+void UdfpsGamutGrid(const uint16_t (*gc_mode)[kUdfpsLutEntries], int (*pos)[kUdfpsGamutDim]) {
+  constexpr int kLast = kUdfpsGamutDim - 1;
+  for (int ch = 0; ch < 3; ch++) {
+    int c = kUdfpsGcComponent[ch];
+    int *p = pos[ch];
+    p[0] = 0;
+    p[kLast] = 4096;
+    for (int k = 1; k < kLast; k++) {
+      int i = 0;
+      if (gc_mode) {
+        while (i < kUdfpsLutEntries - 1 && (gc_mode[c][i] & 0x3FF) < 64 * k) i++;
+      } else {
+        i = 64 * k;
+      }
+      p[k] = std::max(p[k - 1] + 9, 4 * i);
+    }
+    for (int k = kLast - 1; k > 0; k--) {
+      p[k] = std::min(p[k], p[k + 1] - 9);
+    }
+  }
+}
+
+// The identity table on a grid: node (ri, gi, bi) -> its positions, 4096 -> 4095.
+void UdfpsGamutIdentity(const int (*pos)[kUdfpsGamutDim], uint16_t (*nodes)[3]) {
+  for (int n = 0; n < kUdfpsGamutNodes; n++) {
+    int idx[3] = {n % kUdfpsGamutDim, (n / kUdfpsGamutDim) % kUdfpsGamutDim,
+                  n / (kUdfpsGamutDim * kUdfpsGamutDim)};
+    for (int ch = 0; ch < 3; ch++) {
+      nodes[n][ch] = static_cast<uint16_t>(std::min(4095, pos[ch][idx[ch]]));
+    }
+  }
+}
+
+// Tetrahedral interpolation of a 17^3 table (node positions from) at the nodes of another grid
+// (to), rounded to 12 bits: the colour mode's table resampled onto the mask grid. Exact where the
+// two grids share nodes (a node of the old grid is returned as is).
+void UdfpsGamutResample(const uint16_t (*nodes)[3], const int (*from)[kUdfpsGamutDim],
+                        const int (*to)[kUdfpsGamutDim], uint16_t (*out)[3]) {
+  constexpr int kLast = kUdfpsGamutDim - 1;
+  static constexpr int kStride[3] = {1, kUdfpsGamutDim, kUdfpsGamutDim * kUdfpsGamutDim};
+  for (int n = 0; n < kUdfpsGamutNodes; n++) {
+    int idx[3] = {n % kUdfpsGamutDim, (n / kUdfpsGamutDim) % kUdfpsGamutDim,
+                  n / (kUdfpsGamutDim * kUdfpsGamutDim)};
+    int cell = 0;
+    double fr[3];
+    for (int a = 0; a < 3; a++) {
+      int v = to[a][idx[a]];
+      int k = 0;
+      while (k < kLast - 1 && from[a][k + 1] <= v) k++;
+      fr[a] = std::max(0.0, std::min(1.0, static_cast<double>(v - from[a][k]) /
+                                              (from[a][k + 1] - from[a][k])));
+      cell += k * kStride[a];
+    }
+    int order[3] = {0, 1, 2};  // axes by descending fraction, ties in r, g, b order
+    for (int i = 1; i < 3; i++) {
+      for (int j = i; j > 0 && fr[order[j]] > fr[order[j - 1]]; j--) {
+        std::swap(order[j], order[j - 1]);
+      }
+    }
+    double acc[3];
+    int corner = cell;
+    for (int ch = 0; ch < 3; ch++) {
+      acc[ch] = nodes[corner][ch] * (1.0 - fr[order[0]]);
+    }
+    for (int j = 0; j < 3; j++) {
+      corner += kStride[order[j]];
+      double w = fr[order[j]] - (j < 2 ? fr[order[j + 1]] : 0.0);
+      for (int ch = 0; ch < 3; ch++) {
+        acc[ch] = acc[ch] + w * nodes[corner][ch];
+      }
+    }
+    for (int ch = 0; ch < 3; ch++) {
+      out[n][ch] = static_cast<uint16_t>(std::max(0.0, std::min(4095.0, floor(acc[ch] + 0.5))));
+    }
+  }
+}
+
+// The mask gamut table. base: the colour mode's node outputs (r, g, b; 12 bit; identity when the
+// mode sets no gamut), gc_mode: the mode's GC per DRM component (nullptr = none), lut: the mask
+// curve per DRM component (built with the grey toe t_grey, composed as gc = lut[gc_mode[i]]),
+// gain (r, g, b), expo, alpha, toe_knee: the physics shape lut was built from, t_grey / t_alone:
+// the effective toes (r, g, b). A node's channel c reaches the mask curve as the code
+// x_c = gc_mode[w_c >> 2] (12 -> 10 bit by truncation); the colour wants the toe
+//   t_c = t_grey_c + (t_alone_c - t_grey_c) * (1 - s_c),
+//   s_c = clamp((x_o1 + x_o2) / (2 x_c), 0, 1)
+// (grey s = 1: t_grey, the channel alone s = 0: t_alone). Where that toe differs from t_grey on
+// content (0 < x_c, x_c / 1023 <= knee), the node output becomes the GC input code whose composed
+// GC value is nearest the curve value with t_c (ties: the one nearer the old code), written as
+// 4 i + 1, searched no higher than the last code the mode's GC keeps on content; every other node
+// channel keeps the mode's value bit for bit (black, white / the disc, greys). Changed node
+// channels are then kept non-decreasing along their own axis. Returns the number of node channels
+// that differ from base.
+int BuildUdfpsGamutTable(const uint16_t (*base)[3], const uint16_t (*gc_mode)[kUdfpsLutEntries],
+                         const uint16_t (*lut)[kUdfpsLutEntries], const double *gain,
+                         double expo, int alpha, const double *t_grey, const double *t_alone,
+                         double toe_knee, uint16_t (*out)[3]) {
+  double knee = UdfpsKnee(UdfpsKeep(alpha));
+  auto code = [gc_mode](int c, int i) {
+    return gc_mode ? static_cast<int>(gc_mode[c][i] & 0x3FF) : i;
+  };
+  auto gct = [&code, lut](int c, int i) { return static_cast<int>(lut[c][code(c, i)]); };
+  int limit[3];
+  for (int ch = 0; ch < 3; ch++) {
+    limit[ch] = 0;
+    for (int i = 0; i < kUdfpsLutEntries; i++) {
+      if (code(kUdfpsGcComponent[ch], i) / 1023.0 <= knee) {
+        limit[ch] = i;
+      }
+    }
+  }
+  static constexpr int kStride[3] = {1, kUdfpsGamutDim, kUdfpsGamutDim * kUdfpsGamutDim};
+  int changed = 0;
+  for (int n = 0; n < kUdfpsGamutNodes; n++) {
+    int x[3];
+    for (int ch = 0; ch < 3; ch++) {
+      x[ch] = code(kUdfpsGcComponent[ch], std::min(1023, base[n][ch] >> 2));
+      out[n][ch] = base[n][ch];
+    }
+    for (int ch = 0; ch < 3; ch++) {
+      if (x[ch] == 0 || t_alone[ch] == t_grey[ch] || x[ch] / 1023.0 > knee) {
+        continue;
+      }
+      double s = std::min(1.0, std::max(0.0, (x[(ch + 1) % 3] + x[(ch + 2) % 3]) / (2.0 * x[ch])));
+      double toe = t_grey[ch] + (t_alone[ch] - t_grey[ch]) * (1.0 - s);
+      if (toe == t_grey[ch]) {
+        continue;
+      }
+      double y = UdfpsCurveValue(gain[ch], expo, alpha, toe, toe_knee, x[ch] / 1023.0);
+      int want = static_cast<int>(std::min(1023.0, floor(y * 1023.0 + 0.5)));
+      int c = kUdfpsGcComponent[ch];
+      int i0 = std::min(1023, base[n][ch] >> 2);
+      int cur = gct(c, i0);
+      int i = i0;
+      if (want > cur) {
+        while (i < limit[ch] && gct(c, i) < want) i++;
+        if (i > i0 && gct(c, i) - want >= want - gct(c, i - 1)) i--;
+      } else if (want < cur) {
+        while (i > 0 && gct(c, i) > want) i--;
+        if (i < i0 && want - gct(c, i) >= gct(c, i + 1) - want) i++;
+      }
+      if (i != i0) {
+        out[n][ch] = static_cast<uint16_t>(4 * i + 1);
+      }
+    }
+    int idx = n;
+    for (int ch = 0; ch < 3; ch++) {
+      int k = idx % kUdfpsGamutDim;
+      idx /= kUdfpsGamutDim;
+      if (k > 0 && out[n][ch] != base[n][ch] && out[n][ch] < out[n - kStride[ch]][ch]) {
+        out[n][ch] = out[n - kStride[ch]][ch];
+      }
+    }
+    for (int ch = 0; ch < 3; ch++) {
+      changed += out[n][ch] != base[n][ch];
+    }
+  }
+  return changed;
+}
 // UDFPS_MODEL_MATH_END
 
 // Re-reads the calibration table when any of its props changed. Returns true when it did (the
@@ -2271,6 +2527,7 @@ bool PollUdfpsLut() {
   changed |= PollUdfpsProp(&t.pexp_prop, kUdfpsPexpProp);
   changed |= PollUdfpsProp(&t.toe_prop, kUdfpsToeProp);
   changed |= PollUdfpsProp(&t.toe_knee_prop, kUdfpsToeKneeProp);
+  changed |= PollUdfpsProp(&t.toe_alone_prop, kUdfpsToeAloneProp);
   if (!changed) {
     return false;  // (no prop at all: the struct defaults are the physics defaults)
   }
@@ -2314,6 +2571,10 @@ bool PollUdfpsLut() {
   ParseUdfpsPexp(ReadUdfpsProp(t.pexp_prop), t.pexp);
   ParseUdfpsToe(ReadUdfpsProp(t.toe_prop), t.toe);
   t.toe_knee = ParseUdfpsToeKnee(ReadUdfpsProp(t.toe_knee_prop));
+  t.toe_alone_set = ParseUdfpsToeAlone(ReadUdfpsProp(t.toe_alone_prop), t.toe_alone);
+  if (!t.toe_alone_set) {
+    t.toe_alone[0] = t.toe_alone[1] = t.toe_alone[2] = 0.0;
+  }
   t.num_points = n;
   for (int i = 0; i < n; i++) {
     t.level[i] = level[order[i]];
@@ -2321,6 +2582,7 @@ bool PollUdfpsLut() {
   }
   t.fallback_level = (n > 0 && curve_ok[0] && has_level[0]) ? level[0] : (n > 0 ? t.level[0] : 0.0f);
   t.built = false;
+  t.built_physics = false;
   if (n == 0) {
     if (t.model_valid && !t.knots_present) {
       const double *m = t.model;
@@ -2328,9 +2590,18 @@ bool PollUdfpsLut() {
             "%.3f b %.3f %.3f %.3f %.3f", m[0], m[1], m[2], m[3], m[4], m[5], m[6], m[7], m[8],
             m[9], m[10], m[11]);
     } else if (t.physics && !t.knots_present) {
-      DLOGI("IchthysOS udfps_lut: physics curve, gamma %.3f, wb r/g/b %.3f/%.3f/%.3f, "
-            "p0 %.4f p1 %.4f, toe r/g/b %.4f/%.4f/%.4f knee %.3f", t.gamma, t.wb[0], t.wb[1],
-            t.wb[2], t.pexp[0], t.pexp[1], t.toe[0], t.toe[1], t.toe[2], t.toe_knee);
+      if (t.toe_alone_set) {
+        DLOGI("IchthysOS udfps_lut: physics curve, gamma %.3f, wb r/g/b %.3f/%.3f/%.3f, "
+              "p0 %.4f p1 %.4f, toe r/g/b %.4f/%.4f/%.4f knee %.3f, toe alone r/g/b "
+              "%.4f/%.4f/%.4f", t.gamma, t.wb[0], t.wb[1], t.wb[2], t.pexp[0], t.pexp[1],
+              t.toe[0], t.toe[1], t.toe[2], t.toe_knee, t.toe_alone[0], t.toe_alone[1],
+              t.toe_alone[2]);
+      } else {
+        DLOGI("IchthysOS udfps_lut: physics curve, gamma %.3f, wb r/g/b %.3f/%.3f/%.3f, "
+              "p0 %.4f p1 %.4f, toe r/g/b %.4f/%.4f/%.4f knee %.3f, toe alone unset", t.gamma,
+              t.wb[0], t.wb[1], t.wb[2], t.pexp[0], t.pexp[1], t.toe[0], t.toe[1], t.toe[2],
+              t.toe_knee);
+      }
     } else if (prev_points > 0 || prev_auto) {
       DLOGI("IchthysOS udfps_lut: curve invalid or unset, off");
     }
@@ -2421,6 +2692,23 @@ int PollUdfpsSepAlpha(bool *published) {
   return *published ? a.applied : a.fallback;
 }
 
+// IchthysOS: the colour-dependent toe on the 3D gamut is wanted: the physics curve is built and
+// valid and persist.ichthys.udfps_toe_alone gives some channel another effective toe than
+// persist.ichthys.udfps_toe. Otherwise no gamut table (today's behaviour, byte for byte).
+bool UdfpsGamutWanted() {
+  const IchthysUdfpsLut &t = g_udfps_lut;
+  if (!t.valid || !t.built_physics || !t.toe_alone_set) {
+    return false;
+  }
+  for (int ch = 0; ch < 3; ch++) {
+    if (UdfpsToeEffective(t.toe_alone[ch], t.toe_knee) !=
+        UdfpsToeEffective(t.toe[ch], t.toe_knee)) {
+      return true;
+    }
+  }
+  return false;
+}
+
 // IchthysOS: builds g_udfps_lut.lut from the parametric model, else the physics curve, for the
 // panel level (sysfs units, < 0 = unknown: no curve), separator alpha and mask level. Returns true
 // when the curve content may have changed.
@@ -2448,14 +2736,26 @@ bool BuildUdfpsAutoLut(float level, int alpha, bool published, int mask_level) {
     int cd_l = kUdfpsCandela[l];
     int cd_m = kUdfpsCandela[m];
     double expo = UdfpsPhysicsExpo(level, t.pexp);
+    t.built_physics = true;
+    for (int ch = 0; ch < 3; ch++) {
+      t.built_gain[ch] = t.wb[ch] * base;
+    }
+    t.built_expo = expo;
+    double ta[3];
+    for (int ch = 0; ch < 3; ch++) {
+      ta[ch] = UdfpsToeEffective(t.toe_alone_set ? t.toe_alone[ch] : t.toe[ch], t.toe_knee);
+    }
     DLOGI("IchthysOS udfps_lut: physics curve for panel level %d (%d cd) under mask level %d "
           "(%d cd), separator alpha %d (%s): A r/g/b %.3f/%.3f/%.3f, p %.3f, toe r/g/b "
-          "%.4f/%.4f/%.4f knee %.3f", l, cd_l, m, cd_m, alpha, published ? "SystemUI" : "sep_keep",
-          t.wb[0] * base, t.wb[1] * base, t.wb[2] * base, expo,
-          UdfpsToeEffective(t.toe[0], t.toe_knee), UdfpsToeEffective(t.toe[1], t.toe_knee),
-          UdfpsToeEffective(t.toe[2], t.toe_knee), t.toe_knee);
+          "%.4f/%.4f/%.4f knee %.3f, toe alone r/g/b %.4f/%.4f/%.4f, 3D gamut %s", l, cd_l, m,
+          cd_m, alpha, published ? "SystemUI" : "sep_keep", t.wb[0] * base, t.wb[1] * base,
+          t.wb[2] * base, expo, UdfpsToeEffective(t.toe[0], t.toe_knee),
+          UdfpsToeEffective(t.toe[1], t.toe_knee), UdfpsToeEffective(t.toe[2], t.toe_knee),
+          t.toe_knee, ta[0], ta[1], ta[2],
+          UdfpsGamutWanted() ? "on" : (t.toe_alone_set ? "off (toe alone = toe)" : "off (unset)"));
     return true;
   }
+  t.built_physics = false;
   BuildUdfpsModelTable(t.model, level, alpha, t.lut);
   double gain[3] = {};
   double expo[3] = {};
@@ -2531,6 +2831,111 @@ void *HWDeviceDRM::BuildFingerprintLutPgc(bool mask_curve) {
   return out;
 #else
   (void)mask_curve;
+  return nullptr;
+#endif
+}
+
+// IchthysOS: remembers the 3D gamut the colour manager sets (SetPPFeatures; nullptr payload = the
+// mode switches it off), so mask-off can restore it exactly and the mask table can be built on it.
+void HWDeviceDRM::CacheFingerprintGamutBase(const DRMPPFeatureInfo &gamut) {
+#if defined(UDFPS_ZPOS) && defined(PP_DRM_ENABLE)
+  if (!gamut.payload || gamut.payload_size != sizeof(drm_msm_3d_gamut)) {
+    udfps_gamut_base_.clear();
+    return;
+  }
+  const uint8_t *src = static_cast<const uint8_t *>(gamut.payload);
+  udfps_gamut_base_.assign(src, src + sizeof(drm_msm_3d_gamut));
+#else
+  (void)gamut;
+#endif
+}
+
+// IchthysOS: builds the 3D gamut payload to commit: the colour mode's gamut alone (mask_table
+// false; nullptr = gamut off, the mode's state when it set none) or the mask table built on it
+// (the mode's table resampled onto the mask grid, or the identity when it has none, with the
+// colour-dependent toe, BuildUdfpsGamutTable). *changed = node channels the toe changed (relative
+// to the resampled mode table), -1 = the mode's
+// gamut is not the 17x17x17 table the mask table needs (then nullptr is returned for the mask).
+// Caller owns the result (delete as drm_msm_3d_gamut).
+void *HWDeviceDRM::BuildFingerprintGamut(bool mask_table, int *changed) {
+  *changed = 0;
+#if defined(UDFPS_ZPOS) && defined(PP_DRM_ENABLE)
+  static_assert(kUdfpsGamutTables == GAMUT_3D_TBL_NUM &&
+                kUdfpsGamutTableLen == GAMUT_3D_MODE17_TBL_SZ &&
+                kUdfpsGamutTables * kUdfpsGamutTableLen >= kUdfpsGamutNodes &&
+                GAMUT_3D_SCALE_OFF_SZ == kUdfpsGamutDim - 1, "SDE 3D gamut layout");
+  bool have_base = udfps_gamut_base_.size() == sizeof(drm_msm_3d_gamut);
+  if (!mask_table && !have_base) {
+    return nullptr;
+  }
+  drm_msm_3d_gamut *out = new drm_msm_3d_gamut();
+  if (have_base) {
+    memcpy(out, udfps_gamut_base_.data(), sizeof(drm_msm_3d_gamut));
+  }
+  if (!mask_table) {
+    return out;
+  }
+  if (have_base && out->mode != GAMUT_3D_MODE_17) {
+    delete out;
+    *changed = -1;
+    return nullptr;
+  }
+  // IchthysOS: the mask table lives on its own grid, dense near black (UdfpsGamutGrid); the
+  // mode's table is resampled onto it. Only mask frames carry it; mask-off restores the mode's
+  // payload byte for byte.
+  bool have_gc = udfps_pgc_base_.size() == 3 * kUdfpsLutEntries;
+  const uint16_t (*gc_mode)[kUdfpsLutEntries] =
+      have_gc ? reinterpret_cast<const uint16_t (*)[kUdfpsLutEntries]>(udfps_pgc_base_.data())
+              : nullptr;
+  int grid[3][kUdfpsGamutDim];
+  UdfpsGamutGrid(gc_mode, grid);
+  std::vector<uint16_t> mode(3 * kUdfpsGamutNodes);
+  std::vector<uint16_t> base(3 * kUdfpsGamutNodes);
+  std::vector<uint16_t> table(3 * kUdfpsGamutNodes);
+  uint16_t (*mode_nodes)[3] = reinterpret_cast<uint16_t (*)[3]>(mode.data());
+  uint16_t (*base_nodes)[3] = reinterpret_cast<uint16_t (*)[3]>(base.data());
+  uint16_t (*table_nodes)[3] = reinterpret_cast<uint16_t (*)[3]>(table.data());
+  if (have_base) {
+    int mode_grid[3][kUdfpsGamutDim];
+    if (out->flags & GAMUT_3D_MAP_EN) {
+      for (int a = 0; a < 3; a++) {
+        UdfpsGamutScaleOffDecode(out->scale_off[a], mode_grid[a]);
+      }
+    } else {
+      UdfpsGamutUniformGrid(mode_grid);
+    }
+    for (int n = 0; n < kUdfpsGamutNodes; n++) {
+      const drm_msm_3d_col &col = out->col[UdfpsGamutTable(n)][UdfpsGamutEntry(n)];
+      mode_nodes[n][0] = static_cast<uint16_t>(col.c0 & 0xFFF);
+      mode_nodes[n][1] = static_cast<uint16_t>((col.c2_c1 >> 16) & 0xFFF);
+      mode_nodes[n][2] = static_cast<uint16_t>(col.c2_c1 & 0xFFF);
+    }
+    UdfpsGamutResample(mode_nodes, mode_grid, grid, base_nodes);
+  } else {
+    UdfpsGamutIdentity(grid, base_nodes);  // no mode gamut: the identity
+  }
+  out->flags = GAMUT_3D_MAP_EN;
+  out->mode = GAMUT_3D_MODE_17;
+  for (int a = 0; a < GAMUT_3D_SCALE_OFF_TBL_NUM; a++) {
+    UdfpsGamutScaleOffEncode(grid[a], out->scale_off[a]);
+  }
+  const IchthysUdfpsLut &t = g_udfps_lut;
+  double t_grey[3];
+  double t_alone[3];
+  for (int ch = 0; ch < 3; ch++) {
+    t_grey[ch] = UdfpsToeEffective(t.toe[ch], t.toe_knee);
+    t_alone[ch] = UdfpsToeEffective(t.toe_alone_set ? t.toe_alone[ch] : t.toe[ch], t.toe_knee);
+  }
+  *changed = BuildUdfpsGamutTable(base_nodes, gc_mode, t.lut, t.built_gain, t.built_expo,
+                                  t.built_alpha, t_grey, t_alone, t.toe_knee, table_nodes);
+  for (int n = 0; n < kUdfpsGamutNodes; n++) {
+    drm_msm_3d_col &col = out->col[UdfpsGamutTable(n)][UdfpsGamutEntry(n)];
+    col.c0 = table_nodes[n][0];
+    col.c2_c1 = (UINT32(table_nodes[n][1]) << 16) | table_nodes[n][2];
+  }
+  return out;
+#else
+  (void)mask_table;
   return nullptr;
 #endif
 }
@@ -2613,7 +3018,13 @@ void HWDeviceDRM::SetupFingerprintLut(bool fod_present, bool mask_on_edge) {
     }
     want = g_udfps_lut.valid;
   }
-  if (want == udfps_lut_applied_ && !udfps_lut_resend_ && !(want && curve_changed)) {
+  // IchthysOS: the colour-dependent toe (persist.ichthys.udfps_toe_alone) on the DSPP 3D gamut, in
+  // the same request as the GC curve it is built on.
+  bool want_gamut = want && UdfpsGamutWanted();
+  bool gc_send = want != udfps_lut_applied_ || udfps_lut_resend_ || (want && curve_changed);
+  bool gamut_send = want_gamut != udfps_gamut_applied_ || udfps_gamut_resend_ ||
+                    (want_gamut && (curve_changed || udfps_gamut_dirty_));
+  if (!gc_send && !gamut_send) {
     return;
   }
   DRMPPFeatureInfo info = {};
@@ -2622,25 +3033,97 @@ void HWDeviceDRM::SetupFingerprintLut(bool fod_present, bool mask_on_edge) {
   if (info.version == std::numeric_limits<uint32_t>::max() || !hw_color_mgr_) {
     udfps_lut_applied_ = false;  // no DSPP GC on this CRTC: nothing to do, ever
     udfps_lut_resend_ = false;
+    udfps_gamut_applied_ = false;
+    udfps_gamut_resend_ = false;
     return;
   }
-  drm_msm_pgc_lut *payload = static_cast<drm_msm_pgc_lut *>(BuildFingerprintLutPgc(want));
-  info.id = sde_drm::kFeaturePgc;
-  info.type = sde_drm::kPropBlob;
-  info.payload = payload;
-  info.payload_size = sizeof(drm_msm_pgc_lut);
-  // Same path as the colour manager: DRMPPManager owns the blob and frees the previous one.
-  drm_atomic_intf_->Perform(DRMOps::CRTC_SET_POST_PROC, token_.crtc_id, &info);
-  delete payload;
-  if (want != udfps_lut_applied_) {
-    DLOGI("IchthysOS udfps_lut: GC %s", want ? "mask curve" : "restored");
+  if (gc_send) {
+    drm_msm_pgc_lut *payload = static_cast<drm_msm_pgc_lut *>(BuildFingerprintLutPgc(want));
+    info.id = sde_drm::kFeaturePgc;
+    info.type = sde_drm::kPropBlob;
+    info.payload = payload;
+    info.payload_size = sizeof(drm_msm_pgc_lut);
+    // Same path as the colour manager: DRMPPManager owns the blob and frees the previous one.
+    drm_atomic_intf_->Perform(DRMOps::CRTC_SET_POST_PROC, token_.crtc_id, &info);
+    delete payload;
+    if (want != udfps_lut_applied_) {
+      DLOGI("IchthysOS udfps_lut: GC %s", want ? "mask curve" : "restored");
+    }
+    udfps_lut_applied_ = want;
+    udfps_lut_resend_ = false;
+    udfps_lut_in_req_ = true;
   }
-  udfps_lut_applied_ = want;
-  udfps_lut_resend_ = false;
-  udfps_lut_in_req_ = true;
+  if (gamut_send) {
+    SetupFingerprintGamut(want_gamut);
+  }
 #else
   (void)fod_present;
   (void)mask_on_edge;
+#endif
+}
+
+// IchthysOS: puts the wanted 3D gamut into the request: the mask table (want) or the colour
+// mode's own gamut (off when it set none). Only touches the gamut when the mask table is wanted or
+// was applied / in a failed request; with persist.ichthys.udfps_toe_alone unset it is never called
+// with want and the gamut stays the colour manager's alone.
+void HWDeviceDRM::SetupFingerprintGamut(bool want) {
+#if defined(UDFPS_ZPOS) && defined(PP_DRM_ENABLE)
+  DRMPPFeatureInfo info = {};
+  info.id = sde_drm::kFeatureGamut;
+  drm_mgr_intf_->GetCrtcPPInfo(token_.crtc_id, &info);
+  if (info.version != 4) {
+    if (want && !udfps_gamut_warned_) {
+      DLOGW("IchthysOS udfps_lut: no DSPP 3D gamut v4 on this CRTC (version %u), toe alone ignored",
+            info.version);
+      udfps_gamut_warned_ = true;
+    }
+    udfps_gamut_applied_ = false;
+    udfps_gamut_resend_ = false;
+    udfps_gamut_dirty_ = false;
+    return;
+  }
+  int changed = 0;
+  void *payload = want ? BuildFingerprintGamut(true, &changed) : nullptr;
+  if (want && changed < 0) {
+    if (!udfps_gamut_warned_) {
+      DLOGW("IchthysOS udfps_lut: colour mode gamut is not 17x17x17, toe alone ignored");
+      udfps_gamut_warned_ = true;
+    }
+    want = false;
+    if (!udfps_gamut_applied_ && !udfps_gamut_resend_) {
+      udfps_gamut_dirty_ = false;
+      return;  // the mode's gamut is in place and stays
+    }
+  }
+  if (!want) {
+    payload = BuildFingerprintGamut(false, &changed);
+  }
+  info.id = sde_drm::kFeatureGamut;
+  info.type = sde_drm::kPropBlob;
+  info.payload = payload;
+  info.payload_size = sizeof(drm_msm_3d_gamut);
+  drm_atomic_intf_->Perform(DRMOps::CRTC_SET_POST_PROC, token_.crtc_id, &info);
+  delete static_cast<drm_msm_3d_gamut *>(payload);
+  if (want) {
+    int grid[3][kUdfpsGamutDim];
+    bool have_gc = udfps_pgc_base_.size() == 3 * kUdfpsLutEntries;
+    UdfpsGamutGrid(have_gc ? reinterpret_cast<const uint16_t (*)[kUdfpsLutEntries]>(
+                                 udfps_pgc_base_.data()) : nullptr, grid);
+    DLOGI("IchthysOS udfps_lut: 3D gamut mask table on the %s, mask grid g %d %d %d %d %d %d .. "
+          "%d %d (%d node channels changed by the toe)",
+          udfps_gamut_base_.empty() ? "identity" : "colour mode's gamut resampled", grid[1][1],
+          grid[1][2], grid[1][3], grid[1][4], grid[1][5], grid[1][6], grid[1][15], grid[1][16],
+          changed);
+  } else if (udfps_gamut_applied_) {
+    DLOGI("IchthysOS udfps_lut: 3D gamut restored (%s)",
+          udfps_gamut_base_.empty() ? "off" : "colour mode's");
+  }
+  udfps_gamut_applied_ = want;
+  udfps_gamut_resend_ = false;
+  udfps_gamut_dirty_ = false;
+  udfps_gamut_in_req_ = true;
+#else
+  (void)want;
 #endif
 }
 
@@ -2758,7 +3241,11 @@ DisplayError HWDeviceDRM::AtomicCommit(HWLayers *hw_layers) {
   if (ret && udfps_lut_in_req_) {
     udfps_lut_resend_ = true;  // IchthysOS: the UDFPS mask GC may not have landed; send it again
   }
+  if (ret && udfps_gamut_in_req_) {
+    udfps_gamut_resend_ = true;  // IchthysOS: same for the UDFPS mask 3D gamut
+  }
   udfps_lut_in_req_ = false;
+  udfps_gamut_in_req_ = false;
   if (ret) {
     DLOGE("%s failed with error %d crtc %d", __FUNCTION__, ret, token_.crtc_id);
     DumpHWLayers(hw_layers);
@@ -2997,6 +3484,9 @@ DisplayError HWDeviceDRM::SetPPFeatures(PPFeaturesConfig *feature_list) {
   if (!hw_color_mgr_)
     return kErrorNotSupported;
 
+#if defined(UDFPS_ZPOS) && defined(PP_DRM_ENABLE)
+  bool udfps_gamut_compose = false;  // IchthysOS: re-send the UDFPS mask gamut after the list
+#endif
   while (true) {
     std::vector<DRMPPFeatureID> drm_id = {};
     DRMPPFeatureInfo kernel_params = {};
@@ -3034,6 +3524,8 @@ DisplayError HWDeviceDRM::SetPPFeatures(PPFeaturesConfig *feature_list) {
       // mask-off restores. While the curve is applied, a new mode GC goes in composed.
       if (!ret && crtc_feature && id == DRMPPFeatureID::kFeaturePgc) {
         CacheFingerprintLutBase(kernel_params);
+        udfps_gamut_dirty_ = true;  // the mask gamut is built on the mode's GC
+        udfps_gamut_compose |= udfps_gamut_applied_;
         if (udfps_lut_applied_) {
           DRMPPFeatureInfo composed = kernel_params;
           drm_msm_pgc_lut *payload = static_cast<drm_msm_pgc_lut *>(BuildFingerprintLutPgc(true));
@@ -3047,6 +3539,19 @@ DisplayError HWDeviceDRM::SetPPFeatures(PPFeaturesConfig *feature_list) {
         }
         udfps_lut_in_req_ = true;
       }
+      // IchthysOS: the same for the colour mode's 3D gamut: cached as the base of the UDFPS mask
+      // gamut and what mask-off restores; while the mask gamut is applied, it goes in composed
+      // (once, after the whole list, so it is built on this list's GC too).
+      // Without the mask gamut the mode's gamut goes in exactly as before (only cached here).
+      if (!ret && crtc_feature && id == DRMPPFeatureID::kFeatureGamut) {
+        CacheFingerprintGamutBase(kernel_params);
+        udfps_gamut_dirty_ = true;
+        if (udfps_gamut_applied_) {
+          udfps_gamut_compose = true;
+          hw_color_mgr_->FreeDrmFeatureData(&kernel_params);
+          continue;
+        }
+      }
 #endif
       if (!ret && crtc_feature)
         drm_atomic_intf_->Perform(DRMOps::CRTC_SET_POST_PROC,
@@ -3058,6 +3563,12 @@ DisplayError HWDeviceDRM::SetPPFeatures(PPFeaturesConfig *feature_list) {
       hw_color_mgr_->FreeDrmFeatureData(&kernel_params);
     }
   }
+
+#if defined(UDFPS_ZPOS) && defined(PP_DRM_ENABLE)
+  if (udfps_gamut_compose && udfps_gamut_applied_) {
+    SetupFingerprintGamut(true);
+  }
+#endif
 
   // Once all features were consumed, then destroy all feature instance from feature_list,
   feature_list->Reset();

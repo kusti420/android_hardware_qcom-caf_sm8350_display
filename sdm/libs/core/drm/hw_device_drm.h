@@ -200,6 +200,11 @@ class HWDeviceDRM : public HWInterface {
   int GetUdfpsPanelLevel();  // IchthysOS: raw backlight level (0..486), -1 = unreadable
   void CacheFingerprintLutBase(const sde_drm::DRMPPFeatureInfo &pgc);
   void *BuildFingerprintLutPgc(bool mask_curve);
+  // IchthysOS: UDFPS mask colour-dependent toe on the DSPP 3D gamut
+  // (persist.ichthys.udfps_toe_alone). See SetupFingerprintGamut() in hw_device_drm.cpp.
+  void SetupFingerprintGamut(bool want);
+  void CacheFingerprintGamutBase(const sde_drm::DRMPPFeatureInfo &gamut);
+  void *BuildFingerprintGamut(bool mask_table, int *changed);
   void SetSecureConfig(const LayerBuffer &input_buffer, sde_drm::DRMSecureMode *fb_secure_mode,
                        sde_drm::DRMSecurityLevel *security_level);
   bool IsResolutionSwitchEnabled() const { return resolution_switch_enabled_; }
@@ -289,6 +294,15 @@ class HWDeviceDRM : public HWInterface {
   bool udfps_lut_applied_ = false;  // the GC we last put in a request holds the mask curve
   bool udfps_lut_resend_ = false;   // re-send the wanted GC with the next commit
   bool udfps_lut_in_req_ = false;   // the request being committed carries a GC set
+  // IchthysOS: UDFPS mask 3D gamut (DSPP GAMUT v4). udfps_gamut_base_ is the drm_msm_3d_gamut the
+  // colour manager last set (bytes; empty = gamut off), what mask-off restores and the mask table
+  // is built on.
+  std::vector<uint8_t> udfps_gamut_base_ = {};
+  bool udfps_gamut_applied_ = false;  // the gamut we last put in a request holds the mask table
+  bool udfps_gamut_resend_ = false;   // re-send the wanted gamut with the next commit
+  bool udfps_gamut_in_req_ = false;   // the request being committed carries a gamut set
+  bool udfps_gamut_dirty_ = false;    // mode gamut / GC changed since the mask table was sent
+  bool udfps_gamut_warned_ = false;   // no usable gamut logged once
   uint64_t bit_clk_rate_ = 0;
   bool update_mode_ = false;
   HWPowerState pending_power_state_ = kPowerStateNone;
