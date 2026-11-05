@@ -1765,7 +1765,18 @@ void HWDeviceDRM::SetupFingerprintMask(const HWLayersInfo &hw_layer_info, bool v
 // (UdfpsGamutGrid: evenly spaced in the mode GC's output code) onto which the colour mode's own
 // gamut is resampled (tetrahedral; the identity when it has none), and the mode's payload is
 // restored byte for byte afterwards (BuildUdfpsGamutTable).
-// Unset / invalid / equal to udfps_toe (effective values): no gamut is touched at all.
+// Unset / invalid / equal to udfps_toe (effective values) and no residual: no gamut is touched.
+// Measured residual (physics only, on the same mask gamut): persist.ichthys.udfps_res0 .. _res6,
+// concatenated in order (each <= 88 chars), base64url without padding, exactly 375 bytes: a 5x5x5
+// grid over the 8-bit CONTENT levels 0, 24, 48, 72, 96 per axis, node n = ir + 5 ig + 25 ib, three
+// signed bytes per node (r, g, b), ratio = desired output / model output = 1 + q * 0.0025
+// (q -127..127; a byte -128, a wrong length or a bad character = no residual). Each content node
+// channel's model output (the curve value with its toe, before the GC is inverted) is multiplied
+// by the residual trilinearly interpolated at the node's content coordinate
+// u_c = code_c / 1023 / keep * 255 (code_c: the mode GC at the node's grid position; u clamped to
+// 0..96 for the lookup), faded linearly to 1 from max(u) = 96 to 128 (1 beyond), then clamped
+// 0..1 (UdfpsResidualAt / BuildUdfpsGamutTable). A valid residual with some q != 0 runs the gamut
+// stage even without toe alone; unset / invalid / all zero: exactly as without it.
 // Precedence: complete knot point > persist.ichthys.udfps_model > physics; SystemUI uses the
 // separator dim under the same rule (UdfpsController.isUdfpsHalCurveActive), sync mode only.
 namespace {
@@ -1793,6 +1804,15 @@ const char *const kUdfpsPexpProp = "persist.ichthys.udfps_pexp";
 const char *const kUdfpsToeProp = "persist.ichthys.udfps_toe";
 const char *const kUdfpsToeKneeProp = "persist.ichthys.udfps_toe_knee";
 const char *const kUdfpsToeAloneProp = "persist.ichthys.udfps_toe_alone";
+constexpr int kUdfpsResidualProps = 7;
+constexpr int kUdfpsResidualPropLen = 88;  // max chars per prop
+constexpr int kUdfpsResidualNodes = 125;   // 5 x 5 x 5
+constexpr int kUdfpsResidualBytes = 3 * kUdfpsResidualNodes;
+const char *const kUdfpsResidualPropNames[kUdfpsResidualProps] = {
+  "persist.ichthys.udfps_res0", "persist.ichthys.udfps_res1", "persist.ichthys.udfps_res2",
+  "persist.ichthys.udfps_res3", "persist.ichthys.udfps_res4", "persist.ichthys.udfps_res5",
+  "persist.ichthys.udfps_res6",
+};
 constexpr int kUdfpsModelParams = 12;
 constexpr int kUdfpsLevels = 487;  // panel backlight levels 0..486
 constexpr int kUdfpsDefaultMaskLevel = 331;  // the kernel's fingerprint_mask = 1 level
@@ -1833,6 +1853,11 @@ struct IchthysUdfpsLut {
   double toe_knee = 0.1;
   bool toe_alone_set = false;              // persist.ichthys.udfps_toe_alone valid
   double toe_alone[3] = {0.0, 0.0, 0.0};   // r, g, b
+  // IchthysOS: measured residual (persist.ichthys.udfps_res0..6) on the mask gamut.
+  IchthysUdfpsProp res_prop[kUdfpsResidualProps];
+  bool residual_valid = false;
+  int residual_nonzero = 0;                     // nodes channels with q != 0
+  int8_t residual[kUdfpsResidualBytes] = {};    // node n = ir + 5 ig + 25 ib, bytes r, g, b
   // The expanded curve last built and the brightness (model / physics: panel level, alpha and
   // mask level) it was built for.
   bool built = false;
@@ -1860,14 +1885,7 @@ struct IchthysUdfpsAlpha {
 };
 IchthysUdfpsAlpha g_udfps_alpha;
 
-int UdfpsLutB64(char c) {
-  if (c >= 'A' && c <= 'Z') return c - 'A';
-  if (c >= 'a' && c <= 'z') return c - 'a' + 26;
-  if (c >= '0' && c <= '9') return c - '0' + 52;
-  if (c == '-') return 62;
-  if (c == '_') return 63;
-  return -1;
-}
+int UdfpsLutB64(char c);  // base64url digit, -1 if none (UDFPS_MODEL_MATH block)
 
 bool ParseUdfpsKnots(const std::string &value, uint16_t *y) {
   if (value.size() != kUdfpsLutStrLen) {
@@ -1959,6 +1977,15 @@ int ParseUdfpsLevels(const std::string &value, float *level, bool *has) {
 // functions; the calibration dir's udfps_model_test.py compiles the block between the markers on
 // the host and compares it with udfps_lut_ref.py.
 // UDFPS_MODEL_MATH_BEGIN
+int UdfpsLutB64(char c) {
+  if (c >= 'A' && c <= 'Z') return c - 'A';
+  if (c >= 'a' && c <= 'z') return c - 'a' + 26;
+  if (c >= '0' && c <= '9') return c - '0' + 52;
+  if (c == '-') return 62;
+  if (c == '_') return 63;
+  return -1;
+}
+
 // DRM component c (0 = G, 1 = B, 2 = R) -> channel index in the prop (r, g, b).
 constexpr int kUdfpsModelChannel[3] = {1, 2, 0};
 
@@ -2420,6 +2447,82 @@ void UdfpsGamutResample(const uint16_t (*nodes)[3], const int (*from)[kUdfpsGamu
   }
 }
 
+// persist.ichthys.udfps_res0..6 (parts[0..6], in order) -> res[375] (signed, node n = ir + 5 ig
+// + 25 ib, bytes r, g, b). False (res untouched) unless every part is <= 88 chars and the
+// concatenation is exactly 500 base64url characters (375 bytes, no padding) with no byte -128.
+bool ParseUdfpsResidual(const std::string *parts, int8_t *res) {
+  std::string s;
+  for (int p = 0; p < kUdfpsResidualProps; p++) {
+    if (parts[p].size() > static_cast<size_t>(kUdfpsResidualPropLen)) {
+      return false;
+    }
+    s += parts[p];
+  }
+  if (s.size() != static_cast<size_t>(kUdfpsResidualBytes / 3 * 4)) {
+    return false;
+  }
+  int8_t tmp[kUdfpsResidualBytes];
+  for (int g = 0; g < kUdfpsResidualBytes / 3; g++) {
+    uint32_t v = 0;
+    for (int j = 0; j < 4; j++) {
+      int d = UdfpsLutB64(s[4 * g + j]);
+      if (d < 0) {
+        return false;
+      }
+      v = (v << 6) | static_cast<uint32_t>(d);
+    }
+    for (int j = 0; j < 3; j++) {
+      int b = static_cast<int>((v >> (16 - 8 * j)) & 0xFFu);
+      if (b == 0x80) {
+        return false;
+      }
+      tmp[3 * g + j] = static_cast<int8_t>(b < 0x80 ? b : b - 256);
+    }
+  }
+  memcpy(res, tmp, sizeof(tmp));
+  return true;
+}
+
+// The number of residual node channels with q != 0.
+int UdfpsResidualNonzero(const int8_t *res) {
+  int n = 0;
+  for (int i = 0; i < kUdfpsResidualBytes; i++) {
+    n += res[i] != 0;
+  }
+  return n;
+}
+
+// The residual ratio (r, g, b) at the content coordinate u (8-bit content code per axis, r, g, b):
+// trilinear over the levels 0, 24, 48, 72, 96 (u clamped to 0..96), q interpolated, faded to 0
+// linearly from max(u) = 96 to 128 (1 beyond): ratio = 1 + w * q * 0.0025.
+void UdfpsResidualAt(const int8_t *res, const double *u, double *ratio) {
+  double m = std::max(u[0], std::max(u[1], u[2]));
+  double w = m <= 96.0 ? 1.0 : (m >= 128.0 ? 0.0 : (128.0 - m) / 32.0);
+  if (w == 0.0) {
+    ratio[0] = ratio[1] = ratio[2] = 1.0;
+    return;
+  }
+  int k[3];
+  double f[3];
+  for (int a = 0; a < 3; a++) {
+    double v = std::max(0.0, std::min(96.0, u[a]));
+    k[a] = std::min(3, static_cast<int>(v / 24.0));
+    f[a] = (v - 24.0 * k[a]) / 24.0;
+  }
+  for (int ch = 0; ch < 3; ch++) {
+    double acc = 0.0;
+    for (int corner = 0; corner < 8; corner++) {
+      int dr = corner & 1;
+      int dg = (corner >> 1) & 1;
+      int db = corner >> 2;
+      double wt = (dr ? f[0] : 1.0 - f[0]) * (dg ? f[1] : 1.0 - f[1]) * (db ? f[2] : 1.0 - f[2]);
+      int n = (k[0] + dr) + 5 * (k[1] + dg) + 25 * (k[2] + db);
+      acc += wt * res[3 * n + ch];
+    }
+    ratio[ch] = 1.0 + w * acc * 0.0025;
+  }
+}
+
 // The mask gamut table. base: the colour mode's node outputs (r, g, b; 12 bit; identity when the
 // mode sets no gamut), gc_mode: the mode's GC per DRM component (nullptr = none), lut: the mask
 // curve per DRM component (built with the grey toe t_grey, composed as gc = lut[gc_mode[i]]),
@@ -2433,13 +2536,20 @@ void UdfpsGamutResample(const uint16_t (*nodes)[3], const int (*from)[kUdfpsGamu
 // GC value is nearest the curve value with t_c (ties: the one nearer the old code), written as
 // 4 i + 1, searched no higher than the last code the mode's GC keeps on content; every other node
 // channel keeps the mode's value bit for bit (black, white / the disc, greys). Changed node
-// channels are then kept non-decreasing along their own axis. Returns the number of node channels
-// that differ from base.
+// channels are then kept non-decreasing along their own axis.
+// residual (nullptr = none; pos = the mask grid, used only with it): every content channel's curve
+// value (with its toe, t_grey where the toe does not differ) is multiplied by UdfpsResidualAt at
+// the node's content coordinate code(pos) / 1023 / keep * 255 and clamped 0..1 before the same
+// search (black, x = 0 and codes above the knee stay); a content node channel below its axis
+// predecessor that the residual / toe raised is lifted to it as well (non-decreasing). Returns the
+// number of node channels that differ from base.
 int BuildUdfpsGamutTable(const uint16_t (*base)[3], const uint16_t (*gc_mode)[kUdfpsLutEntries],
                          const uint16_t (*lut)[kUdfpsLutEntries], const double *gain,
                          double expo, int alpha, const double *t_grey, const double *t_alone,
-                         double toe_knee, uint16_t (*out)[3]) {
-  double knee = UdfpsKnee(UdfpsKeep(alpha));
+                         double toe_knee, const int (*pos)[kUdfpsGamutDim],
+                         const int8_t *residual, uint16_t (*out)[3]) {
+  double keep = UdfpsKeep(alpha);
+  double knee = UdfpsKnee(keep);
   auto code = [gc_mode](int c, int i) {
     return gc_mode ? static_cast<int>(gc_mode[c][i] & 0x3FF) : i;
   };
@@ -2461,16 +2571,32 @@ int BuildUdfpsGamutTable(const uint16_t (*base)[3], const uint16_t (*gc_mode)[kU
       x[ch] = code(kUdfpsGcComponent[ch], std::min(1023, base[n][ch] >> 2));
       out[n][ch] = base[n][ch];
     }
+    double ratio[3] = {1.0, 1.0, 1.0};
+    if (residual) {
+      int ni[3] = {n % kUdfpsGamutDim, (n / kUdfpsGamutDim) % kUdfpsGamutDim,
+                   n / (kUdfpsGamutDim * kUdfpsGamutDim)};
+      double u[3];
+      for (int ch = 0; ch < 3; ch++) {
+        u[ch] = code(kUdfpsGcComponent[ch], std::min(1023, pos[ch][ni[ch]] >> 2)) / 1023.0 / keep *
+                255.0;
+      }
+      UdfpsResidualAt(residual, u, ratio);
+    }
     for (int ch = 0; ch < 3; ch++) {
-      if (x[ch] == 0 || t_alone[ch] == t_grey[ch] || x[ch] / 1023.0 > knee) {
+      if (x[ch] == 0 || x[ch] / 1023.0 > knee) {
         continue;
       }
-      double s = std::min(1.0, std::max(0.0, (x[(ch + 1) % 3] + x[(ch + 2) % 3]) / (2.0 * x[ch])));
-      double toe = t_grey[ch] + (t_alone[ch] - t_grey[ch]) * (1.0 - s);
-      if (toe == t_grey[ch]) {
+      double toe = t_grey[ch];
+      if (t_alone[ch] != t_grey[ch]) {
+        double s = std::min(1.0, std::max(0.0, (x[(ch + 1) % 3] + x[(ch + 2) % 3]) /
+                                                   (2.0 * x[ch])));
+        toe = t_grey[ch] + (t_alone[ch] - t_grey[ch]) * (1.0 - s);
+      }
+      if (toe == t_grey[ch] && ratio[ch] == 1.0) {
         continue;
       }
       double y = UdfpsCurveValue(gain[ch], expo, alpha, toe, toe_knee, x[ch] / 1023.0);
+      y = std::max(0.0, std::min(1.0, y * ratio[ch]));
       int want = static_cast<int>(std::min(1023.0, floor(y * 1023.0 + 0.5)));
       int c = kUdfpsGcComponent[ch];
       int i0 = std::min(1023, base[n][ch] >> 2);
@@ -2491,8 +2617,15 @@ int BuildUdfpsGamutTable(const uint16_t (*base)[3], const uint16_t (*gc_mode)[kU
     for (int ch = 0; ch < 3; ch++) {
       int k = idx % kUdfpsGamutDim;
       idx /= kUdfpsGamutDim;
-      if (k > 0 && out[n][ch] != base[n][ch] && out[n][ch] < out[n - kStride[ch]][ch]) {
-        out[n][ch] = out[n - kStride[ch]][ch];
+      if (k == 0) {
+        continue;
+      }
+      int prev = n - kStride[ch];
+      bool lift = out[n][ch] != base[n][ch] ||
+                  (residual && x[ch] != 0 && x[ch] / 1023.0 <= knee &&
+                   out[prev][ch] != base[prev][ch] && base[n][ch] >= base[prev][ch]);
+      if (lift && out[n][ch] < out[prev][ch]) {
+        out[n][ch] = out[prev][ch];
       }
     }
     for (int ch = 0; ch < 3; ch++) {
@@ -2528,6 +2661,9 @@ bool PollUdfpsLut() {
   changed |= PollUdfpsProp(&t.toe_prop, kUdfpsToeProp);
   changed |= PollUdfpsProp(&t.toe_knee_prop, kUdfpsToeKneeProp);
   changed |= PollUdfpsProp(&t.toe_alone_prop, kUdfpsToeAloneProp);
+  for (int p = 0; p < kUdfpsResidualProps; p++) {
+    changed |= PollUdfpsProp(&t.res_prop[p], kUdfpsResidualPropNames[p]);
+  }
   if (!changed) {
     return false;  // (no prop at all: the struct defaults are the physics defaults)
   }
@@ -2574,6 +2710,17 @@ bool PollUdfpsLut() {
   t.toe_alone_set = ParseUdfpsToeAlone(ReadUdfpsProp(t.toe_alone_prop), t.toe_alone);
   if (!t.toe_alone_set) {
     t.toe_alone[0] = t.toe_alone[1] = t.toe_alone[2] = 0.0;
+  }
+  {
+    std::string parts[kUdfpsResidualProps];
+    for (int p = 0; p < kUdfpsResidualProps; p++) {
+      parts[p] = ReadUdfpsProp(t.res_prop[p]);
+    }
+    t.residual_valid = ParseUdfpsResidual(parts, t.residual);
+    if (!t.residual_valid) {
+      memset(t.residual, 0, sizeof(t.residual));
+    }
+    t.residual_nonzero = t.residual_valid ? UdfpsResidualNonzero(t.residual) : 0;
   }
   t.num_points = n;
   for (int i = 0; i < n; i++) {
@@ -2692,12 +2839,24 @@ int PollUdfpsSepAlpha(bool *published) {
   return *published ? a.applied : a.fallback;
 }
 
-// IchthysOS: the colour-dependent toe on the 3D gamut is wanted: the physics curve is built and
-// valid and persist.ichthys.udfps_toe_alone gives some channel another effective toe than
-// persist.ichthys.udfps_toe. Otherwise no gamut table (today's behaviour, byte for byte).
+// IchthysOS: a valid residual with some q != 0 (persist.ichthys.udfps_res0..6).
+bool UdfpsResidualActive() {
+  const IchthysUdfpsLut &t = g_udfps_lut;
+  return t.residual_valid && t.residual_nonzero > 0;
+}
+
+// IchthysOS: the 3D gamut stage is wanted: the physics curve is built and valid and either the
+// residual is active or persist.ichthys.udfps_toe_alone gives some channel another effective toe
+// than persist.ichthys.udfps_toe. Otherwise no gamut table (today's behaviour, byte for byte).
 bool UdfpsGamutWanted() {
   const IchthysUdfpsLut &t = g_udfps_lut;
-  if (!t.valid || !t.built_physics || !t.toe_alone_set) {
+  if (!t.valid || !t.built_physics) {
+    return false;
+  }
+  if (UdfpsResidualActive()) {
+    return true;
+  }
+  if (!t.toe_alone_set) {
     return false;
   }
   for (int ch = 0; ch < 3; ch++) {
@@ -2745,14 +2904,22 @@ bool BuildUdfpsAutoLut(float level, int alpha, bool published, int mask_level) {
     for (int ch = 0; ch < 3; ch++) {
       ta[ch] = UdfpsToeEffective(t.toe_alone_set ? t.toe_alone[ch] : t.toe[ch], t.toe_knee);
     }
+    char res_state[40];
+    if (UdfpsResidualActive()) {
+      snprintf(res_state, sizeof(res_state), "on (%d nonzero)", t.residual_nonzero);
+    } else {
+      snprintf(res_state, sizeof(res_state), "%s", t.residual_valid ? "off (all zero)" : "off");
+    }
     DLOGI("IchthysOS udfps_lut: physics curve for panel level %d (%d cd) under mask level %d "
           "(%d cd), separator alpha %d (%s): A r/g/b %.3f/%.3f/%.3f, p %.3f, toe r/g/b "
-          "%.4f/%.4f/%.4f knee %.3f, toe alone r/g/b %.4f/%.4f/%.4f, 3D gamut %s", l, cd_l, m,
+          "%.4f/%.4f/%.4f knee %.3f, toe alone r/g/b %.4f/%.4f/%.4f, 3D gamut %s, residual %s", l,
+          cd_l, m,
           cd_m, alpha, published ? "SystemUI" : "sep_keep", t.wb[0] * base, t.wb[1] * base,
           t.wb[2] * base, expo, UdfpsToeEffective(t.toe[0], t.toe_knee),
           UdfpsToeEffective(t.toe[1], t.toe_knee), UdfpsToeEffective(t.toe[2], t.toe_knee),
           t.toe_knee, ta[0], ta[1], ta[2],
-          UdfpsGamutWanted() ? "on" : (t.toe_alone_set ? "off (toe alone = toe)" : "off (unset)"));
+          UdfpsGamutWanted() ? "on" : (t.toe_alone_set ? "off (toe alone = toe)" : "off (unset)"),
+          res_state);
     return true;
   }
   t.built_physics = false;
@@ -2853,7 +3020,8 @@ void HWDeviceDRM::CacheFingerprintGamutBase(const DRMPPFeatureInfo &gamut) {
 // IchthysOS: builds the 3D gamut payload to commit: the colour mode's gamut alone (mask_table
 // false; nullptr = gamut off, the mode's state when it set none) or the mask table built on it
 // (the mode's table resampled onto the mask grid, or the identity when it has none, with the
-// colour-dependent toe, BuildUdfpsGamutTable). *changed = node channels the toe changed (relative
+// colour-dependent toe and the measured residual, BuildUdfpsGamutTable). *changed = node channels
+// the toe / residual changed (relative
 // to the resampled mode table), -1 = the mode's
 // gamut is not the 17x17x17 table the mask table needs (then nullptr is returned for the mask).
 // Caller owns the result (delete as drm_msm_3d_gamut).
@@ -2927,7 +3095,8 @@ void *HWDeviceDRM::BuildFingerprintGamut(bool mask_table, int *changed) {
     t_alone[ch] = UdfpsToeEffective(t.toe_alone_set ? t.toe_alone[ch] : t.toe[ch], t.toe_knee);
   }
   *changed = BuildUdfpsGamutTable(base_nodes, gc_mode, t.lut, t.built_gain, t.built_expo,
-                                  t.built_alpha, t_grey, t_alone, t.toe_knee, table_nodes);
+                                  t.built_alpha, t_grey, t_alone, t.toe_knee, grid,
+                                  UdfpsResidualActive() ? t.residual : nullptr, table_nodes);
   for (int n = 0; n < kUdfpsGamutNodes; n++) {
     drm_msm_3d_col &col = out->col[UdfpsGamutTable(n)][UdfpsGamutEntry(n)];
     col.c0 = table_nodes[n][0];
@@ -3018,8 +3187,9 @@ void HWDeviceDRM::SetupFingerprintLut(bool fod_present, bool mask_on_edge) {
     }
     want = g_udfps_lut.valid;
   }
-  // IchthysOS: the colour-dependent toe (persist.ichthys.udfps_toe_alone) on the DSPP 3D gamut, in
-  // the same request as the GC curve it is built on.
+  // IchthysOS: the colour-dependent toe (persist.ichthys.udfps_toe_alone) and the measured
+  // residual (persist.ichthys.udfps_res0..6) on the DSPP 3D gamut, in the same request as the GC
+  // curve it is built on.
   bool want_gamut = want && UdfpsGamutWanted();
   bool gc_send = want != udfps_lut_applied_ || udfps_lut_resend_ || (want && curve_changed);
   bool gamut_send = want_gamut != udfps_gamut_applied_ || udfps_gamut_resend_ ||
@@ -3064,8 +3234,9 @@ void HWDeviceDRM::SetupFingerprintLut(bool fod_present, bool mask_on_edge) {
 
 // IchthysOS: puts the wanted 3D gamut into the request: the mask table (want) or the colour
 // mode's own gamut (off when it set none). Only touches the gamut when the mask table is wanted or
-// was applied / in a failed request; with persist.ichthys.udfps_toe_alone unset it is never called
-// with want and the gamut stays the colour manager's alone.
+// was applied / in a failed request; with persist.ichthys.udfps_toe_alone and the residual
+// (persist.ichthys.udfps_res0..6) unset it is never called with want and the gamut stays the
+// colour manager's alone.
 void HWDeviceDRM::SetupFingerprintGamut(bool want) {
 #if defined(UDFPS_ZPOS) && defined(PP_DRM_ENABLE)
   DRMPPFeatureInfo info = {};
@@ -3073,8 +3244,8 @@ void HWDeviceDRM::SetupFingerprintGamut(bool want) {
   drm_mgr_intf_->GetCrtcPPInfo(token_.crtc_id, &info);
   if (info.version != 4) {
     if (want && !udfps_gamut_warned_) {
-      DLOGW("IchthysOS udfps_lut: no DSPP 3D gamut v4 on this CRTC (version %u), toe alone ignored",
-            info.version);
+      DLOGW("IchthysOS udfps_lut: no DSPP 3D gamut v4 on this CRTC (version %u), toe alone / "
+            "residual ignored", info.version);
       udfps_gamut_warned_ = true;
     }
     udfps_gamut_applied_ = false;
@@ -3086,7 +3257,8 @@ void HWDeviceDRM::SetupFingerprintGamut(bool want) {
   void *payload = want ? BuildFingerprintGamut(true, &changed) : nullptr;
   if (want && changed < 0) {
     if (!udfps_gamut_warned_) {
-      DLOGW("IchthysOS udfps_lut: colour mode gamut is not 17x17x17, toe alone ignored");
+      DLOGW("IchthysOS udfps_lut: colour mode gamut is not 17x17x17, toe alone / residual "
+                "ignored");
       udfps_gamut_warned_ = true;
     }
     want = false;
@@ -3110,7 +3282,7 @@ void HWDeviceDRM::SetupFingerprintGamut(bool want) {
     UdfpsGamutGrid(have_gc ? reinterpret_cast<const uint16_t (*)[kUdfpsLutEntries]>(
                                  udfps_pgc_base_.data()) : nullptr, grid);
     DLOGI("IchthysOS udfps_lut: 3D gamut mask table on the %s, mask grid g %d %d %d %d %d %d .. "
-          "%d %d (%d node channels changed by the toe)",
+          "%d %d (%d node channels changed by the toe / residual)",
           udfps_gamut_base_.empty() ? "identity" : "colour mode's gamut resampled", grid[1][1],
           grid[1][2], grid[1][3], grid[1][4], grid[1][5], grid[1][6], grid[1][15], grid[1][16],
           changed);
