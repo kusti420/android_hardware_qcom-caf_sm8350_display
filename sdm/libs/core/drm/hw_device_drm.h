@@ -205,6 +205,11 @@ class HWDeviceDRM : public HWInterface {
   void SetupFingerprintGamut(bool want);
   void CacheFingerprintGamutBase(const sde_drm::DRMPPFeatureInfo &gamut);
   void *BuildFingerprintGamut(bool mask_table, int *changed);
+  // IchthysOS: UDFPS mask panel dither (PP dither to the panel's 8 bpc,
+  // persist.ichthys.udfps_dither). See SetupFingerprintDither() in hw_device_drm.cpp.
+  void SetupFingerprintDither(bool want);
+  void CacheFingerprintDitherBase(const sde_drm::DRMPPFeatureInfo &dither);
+  bool UdfpsDitherTarget(sde_drm::DRMPPFeatureID *id, bool *crtc);
   void SetSecureConfig(const LayerBuffer &input_buffer, sde_drm::DRMSecureMode *fb_secure_mode,
                        sde_drm::DRMSecurityLevel *security_level);
   bool IsResolutionSwitchEnabled() const { return resolution_switch_enabled_; }
@@ -303,6 +308,13 @@ class HWDeviceDRM : public HWInterface {
   bool udfps_gamut_in_req_ = false;   // the request being committed carries a gamut set
   bool udfps_gamut_dirty_ = false;    // mode gamut / GC changed since the mask table was sent
   bool udfps_gamut_warned_ = false;   // no usable gamut logged once
+  // IchthysOS: UDFPS mask panel dither. udfps_dither_base_ is the drm_msm_dither the colour manager
+  // last set (bytes; empty = off / never set), what mask-off restores.
+  std::vector<uint8_t> udfps_dither_base_ = {};
+  bool udfps_dither_applied_ = false;  // the dither we last put in a request is the mask one
+  bool udfps_dither_resend_ = false;   // re-send the wanted dither with the next commit
+  bool udfps_dither_in_req_ = false;   // the request being committed carries a dither set
+  int udfps_dither_conn_ = -1;         // connector has SDE_PP_DITHER_V*: -1 unknown, 0 no, 1 yes
   uint64_t bit_clk_rate_ = 0;
   bool update_mode_ = false;
   HWPowerState pending_power_state_ = kPowerStateNone;
