@@ -1792,6 +1792,22 @@ void HWDeviceDRM::SetupFingerprintMask(const HWLayersInfo &hw_layer_info, bool v
 // m_k (k + 1) / (k + 2) and m_15 <= 1.25 (UdfpsDarkMults; y * m(y) then has slope >= 0
 // everywhere) and the rounded GC table is a running maximum. The 3D gamut stage targets the same
 // corrected curve. Unset / invalid / all zero: byte-identical tables (UdfpsDarkCorrect).
+// Temperature trim (physics only, 1D, on the GC curve): the mask compensation drifts with the
+// panel temperature (measured: mask-on content ~3 % too bright at 26 C, ~0.5 % at 31 C, i.e.
+// about -0.5 %/C in the code domain). At mask-on (once per mask session, with the panel level) a
+// temperature is read from persist.ichthys.udfps_tpath (an absolute path without "..", default
+// /sys/class/power_supply/battery/temp: tenths of a degree C; with "thermal_zone" in the path a
+// value > 1000 is millidegrees), clamped to 10..50 C and rounded to 0.5 C: T. With
+// persist.ichthys.udfps_tref (plain decimal 0..100, default 31) and persist.ichthys.udfps_tcoef
+// "kr kg kb" (plain decimals, each clamped to +-0.03; the fractional change per C of the needed
+// output multiplier; unset / invalid = no trim):
+//   m_c = clamp(1 + k_c (T - tref), 0.8, 1.2)
+// and the content output y (after the toe and the dark correction, before the 10-bit rounding)
+// becomes min(1, y * m_c); y = 0 stays 0, the disc stays full and the ramp keeps running from the
+// (trimmed) top content value to 1, so the curve stays continuous and non-decreasing. The 3D gamut
+// stage targets the same trimmed curve. The curve cache keys on T (rebuilt when it changes
+// between mask sessions). Unreadable temperature: no trim (warned once per path); no tcoef / all
+// m_c = 1: byte-identical tables (UdfpsTempTrim / UdfpsTrim).
 // Panel dither on mask frames: the GC's 10-bit output reaches the 8-bit panel (DSI RGB888, DSC
 // 8 bpc, a52sxq DT) through the PINGPONG dither (connector property SDE_PP_DITHER_V*,
 // drm_msm_dither); the device's QDCM SDR modes leave it disabled (sRGB / Natural:
@@ -1845,6 +1861,12 @@ const char *const kUdfpsDarkProps[3] = {
   "persist.ichthys.udfps_dark_r", "persist.ichthys.udfps_dark_g", "persist.ichthys.udfps_dark_b",
 };
 const char *const kUdfpsDitherProp = "persist.ichthys.udfps_dither";
+// IchthysOS: temperature trim of the physics curve.
+const char *const kUdfpsTempPathProp = "persist.ichthys.udfps_tpath";
+const char *const kUdfpsTempRefProp = "persist.ichthys.udfps_tref";
+const char *const kUdfpsTempCoefProp = "persist.ichthys.udfps_tcoef";
+const char *const kUdfpsTempDefaultPath = "/sys/class/power_supply/battery/temp";
+constexpr int kUdfpsNoTempKey = -1;  // the curve cache's temperature key without a trim
 constexpr int kUdfpsDarkKnots = 16;
 constexpr int kUdfpsModelParams = 12;
 constexpr int kUdfpsLevels = 487;  // panel backlight levels 0..486
@@ -1897,6 +1919,16 @@ struct IchthysUdfpsLut {
   bool dark_valid[3] = {};
   bool dark_active[3] = {};                     // valid with some q != 0
   double dark[3][kUdfpsDarkKnots] = {};         // the multipliers (UdfpsDarkMults)
+  // IchthysOS: temperature trim (persist.ichthys.udfps_tpath / _tref / _tcoef).
+  IchthysUdfpsProp tpath_prop;
+  IchthysUdfpsProp tref_prop;
+  IchthysUdfpsProp tcoef_prop;
+  std::string tpath = kUdfpsTempDefaultPath;
+  double tref = 31.0;
+  bool tcoef_set = false;
+  double tcoef[3] = {};       // r, g, b (clamped to +-0.03)
+  double temp = NAN;          // C as read at mask-on (UpdateUdfpsTemp), NAN = unknown
+  bool temp_warned = false;   // unreadable logged for tpath
   // The expanded curve last built and the brightness (model / physics: panel level, alpha and
   // mask level) it was built for.
   bool built = false;
@@ -1910,6 +1942,10 @@ struct IchthysUdfpsLut {
   bool built_physics = false;
   double built_gain[3] = {};  // r, g, b
   double built_expo = 1.0;
+  // IchthysOS: the temperature trim lut was built with (key 2 T, kUdfpsNoTempKey = none).
+  int built_temp_key = kUdfpsNoTempKey;
+  bool built_trim_active = false;
+  double built_trim[3] = {1.0, 1.0, 1.0};  // r, g, b
 };
 IchthysUdfpsLut g_udfps_lut;
 
@@ -2161,22 +2197,73 @@ void UdfpsDarkMults(const int8_t *q, double *m) {
   m[kUdfpsDarkKnots - 1] = std::min(m[kUdfpsDarkKnots - 1], 1.25);
 }
 
+// IchthysOS: temperature trim. A sysfs temperature text (an integer with an optional sign,
+// leading spaces / tabs, trailing spaces / tabs / newline) -> degrees C: tenths of a degree, or
+// millidegrees when thermal_zone (the path contains "thermal_zone") and the value is > 1000.
+// False (celsius untouched) for anything else or |v| > 10^7.
+bool UdfpsParseTemp(const char *text, bool thermal_zone, double *celsius) {
+  const char *s = text;
+  while (*s == ' ' || *s == '\t') s++;
+  const char *d = (*s == '+' || *s == '-') ? s + 1 : s;
+  if (*d < '0' || *d > '9') {
+    return false;
+  }
+  char *stop = nullptr;
+  long v = strtol(s, &stop, 10);
+  while (*stop == ' ' || *stop == '\t' || *stop == '\n' || *stop == '\r') stop++;
+  if (*stop || v < -10000000L || v > 10000000L) {
+    return false;
+  }
+  *celsius = (thermal_zone && v > 1000) ? v / 1000.0 : v / 10.0;
+  return true;
+}
+
+// The trim temperature T: clamped to 10..50 C, rounded to 0.5 C (half up).
+double UdfpsTempQuant(double celsius) {
+  double v = std::max(10.0, std::min(50.0, celsius));
+  return floor(v * 2.0 + 0.5) * 0.5;
+}
+
+// The multipliers m_c = clamp(1 + k_c (T - tref), 0.8, 1.2), k_c clamped to +-0.03 (r, g, b), for
+// T = temp_q (UdfpsTempQuant). Returns true when some m_c != 1. (Separate statements: no FMA
+// contraction, bit-exact with udfps_lut_ref.py.)
+bool UdfpsTempTrim(double temp_q, double tref, const double *tcoef, double *trim) {
+  bool active = false;
+  for (int ch = 0; ch < 3; ch++) {
+    double k = std::max(-0.03, std::min(0.03, tcoef[ch]));
+    double d = k * (temp_q - tref);
+    double m = 1.0 + d;
+    trim[ch] = std::max(0.8, std::min(1.2, m));
+    active |= trim[ch] != 1.0;
+  }
+  return active;
+}
+
+// The temperature trim of a content output y: min(1, y * m); m = 1 and y <= 0 unchanged.
+double UdfpsTrim(double y, double m) {
+  if (m == 1.0 || !(y > 0.0)) {
+    return y;
+  }
+  return std::min(1.0, y * m);
+}
+
 // One channel's curve at normalised input x (0..1), before the 10-bit rounding: total gain and
-// exponent below the knee (then the toe, 0 = none, then the dark correction, nullptr = none), ramp
-// to the disc.
+// exponent below the knee (then the toe, 0 = none, then the dark correction, nullptr = none, then
+// the temperature trim, 1 = none), ramp from that top content value to the disc.
 double UdfpsCurveValue(double gain, double expo, int alpha, double toe, double toe_knee,
-                       const double *dark, double x) {
+                       const double *dark, double trim, double x) {
   double keep = UdfpsKeep(alpha);
   double knee = UdfpsKnee(keep);
   double full = std::max(knee, 1020.0 / 1023.0);
   double y;
   if (x <= knee) {
-    y = UdfpsDarkCorrect(UdfpsToe(std::min(1.0, gain * pow(x / keep, expo)), toe, toe_knee), dark);
+    y = UdfpsTrim(UdfpsDarkCorrect(UdfpsToe(std::min(1.0, gain * pow(x / keep, expo)), toe,
+                                            toe_knee), dark), trim);
   } else if (x >= full) {
     y = 1.0;
   } else {
-    double y_top = UdfpsDarkCorrect(UdfpsToe(std::min(1.0, gain * pow(knee / keep, expo)), toe,
-                                             toe_knee), dark);
+    double y_top = UdfpsTrim(UdfpsDarkCorrect(UdfpsToe(std::min(1.0, gain * pow(knee / keep, expo)),
+                                                       toe, toe_knee), dark), trim);
     y = y_top + (x - knee) * (1.0 - y_top) / (full - knee);
   }
   return std::max(0.0, std::min(1.0, y));
@@ -2185,9 +2272,9 @@ double UdfpsCurveValue(double gain, double expo, int alpha, double toe, double t
 // One channel's 1024-entry GC curve (UdfpsCurveValue at x = i / 1023, rounded to 10 bits; with a
 // dark correction also a running maximum, so the table never decreases).
 void BuildUdfpsCurve(double gain, double expo, int alpha, double toe, double toe_knee,
-                     const double *dark, uint16_t *out) {
+                     const double *dark, double trim, uint16_t *out) {
   for (int i = 0; i < kUdfpsLutEntries; i++) {
-    double y = UdfpsCurveValue(gain, expo, alpha, toe, toe_knee, dark, i / 1023.0);
+    double y = UdfpsCurveValue(gain, expo, alpha, toe, toe_knee, dark, trim, i / 1023.0);
     out[i] = static_cast<uint16_t>(std::min(1023.0, floor(y * 1023.0 + 0.5)));
     if (dark && i > 0 && out[i] < out[i - 1]) {
       out[i] = out[i - 1];
@@ -2202,7 +2289,7 @@ void BuildUdfpsModelTable(const double *params, double level, int alpha,
     double gain = 1.0;
     double expo = 1.0;
     UdfpsModelShape(params, kUdfpsModelChannel[c], level, &gain, &expo);
-    BuildUdfpsCurve(gain, expo, alpha, 0.0, 0.1, nullptr, out[c]);
+    BuildUdfpsCurve(gain, expo, alpha, 0.0, 0.1, nullptr, 1.0, out[c]);
   }
 }
 
@@ -2361,6 +2448,25 @@ bool ParseUdfpsToeAlone(const std::string &value, double *toe_alone) {
   return ParseUdfpsPlainList(value, 3, 0.0, 0.05, toe_alone);
 }
 
+// persist.ichthys.udfps_tref: one plain decimal 0..100 (C), else 31.
+double ParseUdfpsTref(const std::string &value) {
+  double v = 31.0;
+  return ParseUdfpsPlainList(value, 1, 0.0, 100.0, &v) ? v : 31.0;
+}
+
+// persist.ichthys.udfps_tcoef "kr kg kb": three plain decimals |v| <= 100, each clamped to +-0.03;
+// false (k untouched) when unset or invalid (no temperature trim).
+bool ParseUdfpsTcoef(const std::string &value, double *k) {
+  double v[3] = {};
+  if (!ParseUdfpsPlainList(value, 3, -100.0, 100.0, v)) {
+    return false;
+  }
+  for (int ch = 0; ch < 3; ch++) {
+    k[ch] = std::max(-0.03, std::min(0.03, v[ch]));
+  }
+  return true;
+}
+
 // The toe actually applied: at most half the toe knee (keeps the curve increasing).
 double UdfpsToeEffective(double toe, double toe_knee) {
   return std::min(toe, 0.5 * toe_knee);
@@ -2379,17 +2485,19 @@ double UdfpsPhysicsBase(double level, int mask_level, double gamma) {
   return pow(static_cast<double>(kUdfpsCandela[l]) / kUdfpsCandela[m], 1.0 / gamma);
 }
 
-// The physics GC curve per DRM component (wb, toe and dark in r, g, b order; dark = nullptr or
-// per channel the multipliers / nullptr: no dark correction).
+// The physics GC curve per DRM component (wb, toe, dark and trim in r, g, b order; dark = nullptr
+// or per channel the multipliers / nullptr: no dark correction; trim = nullptr or the temperature
+// multipliers, UdfpsTempTrim).
 void BuildUdfpsPhysicsTable(double level, int mask_level, double gamma, const double *wb,
                             const double *pexp, const double *toe, double toe_knee, int alpha,
-                            const double *const *dark, uint16_t (*out)[kUdfpsLutEntries]) {
+                            const double *const *dark, const double *trim,
+                            uint16_t (*out)[kUdfpsLutEntries]) {
   double base = UdfpsPhysicsBase(level, mask_level, gamma);
   double expo = UdfpsPhysicsExpo(level, pexp);
   for (int c = 0; c < 3; c++) {
     int ch = kUdfpsModelChannel[c];
     BuildUdfpsCurve(wb[ch] * base, expo, alpha, UdfpsToeEffective(toe[ch], toe_knee), toe_knee,
-                    dark ? dark[ch] : nullptr, out[c]);
+                    dark ? dark[ch] : nullptr, trim ? trim[ch] : 1.0, out[c]);
   }
 }
 
@@ -2663,13 +2771,15 @@ void UdfpsResidualAt(const int8_t *res, int levels, const double *u, double *rat
 // clamped 0..1 before the same search (black, x = 0 and codes above the knee stay); a content node
 // channel below its axis predecessor that the residual / toe raised is lifted to it as well
 // (non-decreasing). dark: the dark corrections lut was built with (r, g, b; nullptr = none), the
-// curve values include them. Returns the number of node channels that differ from base.
+// curve values include them; trim: the temperature multipliers lut was built with (r, g, b;
+// nullptr = none), the curve values include them too. Returns the number of node channels that
+// differ from base.
 int BuildUdfpsGamutTable(const uint16_t (*base)[3], const uint16_t (*gc_mode)[kUdfpsLutEntries],
                          const uint16_t (*lut)[kUdfpsLutEntries], const double *gain,
                          double expo, int alpha, const double *t_grey, const double *t_alone,
                          double toe_knee, const int (*pos)[kUdfpsGamutDim],
                          const int8_t *residual, int residual_levels, const double *const *dark,
-                         uint16_t (*out)[3]) {
+                         const double *trim, uint16_t (*out)[3]) {
   double keep = UdfpsKeep(alpha);
   double knee = UdfpsKnee(keep);
   auto code = [gc_mode](int c, int i) {
@@ -2718,7 +2828,7 @@ int BuildUdfpsGamutTable(const uint16_t (*base)[3], const uint16_t (*gc_mode)[kU
         continue;
       }
       double y = UdfpsCurveValue(gain[ch], expo, alpha, toe, toe_knee, dark ? dark[ch] : nullptr,
-                                 x[ch] / 1023.0);
+                                 trim ? trim[ch] : 1.0, x[ch] / 1023.0);
       y = std::max(0.0, std::min(1.0, y * ratio[ch]));
       int want = static_cast<int>(std::min(1023.0, floor(y * 1023.0 + 0.5)));
       int c = kUdfpsGcComponent[ch];
@@ -2759,6 +2869,15 @@ int BuildUdfpsGamutTable(const uint16_t (*base)[3], const uint16_t (*gc_mode)[kU
 }
 // UDFPS_MODEL_MATH_END
 
+// IchthysOS: persist.ichthys.udfps_tpath -> the temperature path: an absolute path without "..",
+// else (unset / empty / relative) the default, the battery temperature.
+std::string UdfpsTempPath(const std::string &value) {
+  if (value.empty() || value[0] != '/' || value.find("..") != std::string::npos) {
+    return kUdfpsTempDefaultPath;
+  }
+  return value;
+}
+
 // Re-reads the calibration table when any of its props changed. Returns true when it did (the
 // curve must then be rebuilt).
 bool PollUdfpsLut() {
@@ -2790,6 +2909,9 @@ bool PollUdfpsLut() {
   for (int ch = 0; ch < 3; ch++) {
     changed |= PollUdfpsProp(&t.dark_prop[ch], kUdfpsDarkProps[ch]);
   }
+  changed |= PollUdfpsProp(&t.tpath_prop, kUdfpsTempPathProp);
+  changed |= PollUdfpsProp(&t.tref_prop, kUdfpsTempRefProp);
+  changed |= PollUdfpsProp(&t.tcoef_prop, kUdfpsTempCoefProp);
   if (!changed) {
     return false;  // (no prop at all: the struct defaults are the physics defaults)
   }
@@ -2858,6 +2980,19 @@ bool PollUdfpsLut() {
       t.dark_active[ch] |= t.dark_valid[ch] && q[k] != 0;
     }
     UdfpsDarkMults(q, t.dark[ch]);  // all 1 when unset / invalid / all zero (then unused)
+  }
+  {
+    std::string path = UdfpsTempPath(ReadUdfpsProp(t.tpath_prop));
+    if (path != t.tpath) {
+      t.tpath = path;
+      t.temp = NAN;  // re-read from the new path (the caller does, table changed)
+      t.temp_warned = false;
+    }
+  }
+  t.tref = ParseUdfpsTref(ReadUdfpsProp(t.tref_prop));
+  t.tcoef_set = ParseUdfpsTcoef(ReadUdfpsProp(t.tcoef_prop), t.tcoef);
+  if (!t.tcoef_set) {
+    t.tcoef[0] = t.tcoef[1] = t.tcoef[2] = 0.0;
   }
   t.num_points = n;
   for (int i = 0; i < n; i++) {
@@ -2994,6 +3129,38 @@ const double *const *UdfpsDarkPtrs(const IchthysUdfpsLut &t, const double **buf)
   return any ? buf : nullptr;
 }
 
+// IchthysOS: the temperature (C) from a sysfs node (UdfpsParseTemp); false when unreadable.
+bool ReadUdfpsTemp(const std::string &path, double *celsius) {
+  int fd = open(path.c_str(), O_RDONLY | O_CLOEXEC);
+  if (fd < 0) {
+    return false;
+  }
+  char buf[32];
+  ssize_t n = read(fd, buf, sizeof(buf) - 1);
+  close(fd);
+  if (n <= 0) {
+    return false;
+  }
+  buf[n] = '\0';
+  return UdfpsParseTemp(buf, path.find("thermal_zone") != std::string::npos, celsius);
+}
+
+// IchthysOS: reads the temperature for the trim into g_udfps_lut.temp (NAN = unreadable: no trim,
+// logged once per path). Called at mask-on with the panel level, physics curve only.
+void UpdateUdfpsTemp() {
+  IchthysUdfpsLut &t = g_udfps_lut;
+  double c = NAN;
+  if (ReadUdfpsTemp(t.tpath, &c)) {
+    t.temp = c;
+    return;
+  }
+  t.temp = NAN;
+  if (!t.temp_warned) {
+    DLOGW("IchthysOS udfps_lut: temperature %s unreadable, no temperature trim", t.tpath.c_str());
+    t.temp_warned = true;
+  }
+}
+
 // IchthysOS: persist.ichthys.udfps_dither (default on, off for Android's false spellings) through
 // the property area's serial: force the panel dither on while the mask curve is applied.
 struct IchthysUdfpsDither {
@@ -3050,18 +3217,40 @@ bool BuildUdfpsAutoLut(float level, int alpha, bool published, int mask_level) {
     t.valid = false;
     return was_valid;
   }
+  // IchthysOS: the temperature trim (physics only): T = the read temperature clamped and rounded
+  // to 0.5 C is part of the cache key while some multiplier != 1.
+  double trim[3] = {1.0, 1.0, 1.0};
+  bool trim_on = false;
+  int temp_key = kUdfpsNoTempKey;
+  double temp_q = NAN;
+  if (!t.model_valid && std::isfinite(t.temp)) {
+    temp_q = UdfpsTempQuant(t.temp);
+    if (t.tcoef_set) {
+      trim_on = UdfpsTempTrim(temp_q, t.tref, t.tcoef, trim);
+      if (trim_on) {
+        temp_key = static_cast<int>(lround(temp_q * 2.0));
+      } else {
+        trim[0] = trim[1] = trim[2] = 1.0;
+      }
+    }
+  }
   if (t.built && t.valid && level == t.built_level && alpha == t.built_alpha &&
-      mask_level == t.built_mask) {
+      mask_level == t.built_mask && temp_key == t.built_temp_key) {
     return false;
   }
   t.valid = t.built = true;
   t.built_level = level;
   t.built_alpha = alpha;
   t.built_mask = mask_level;
+  t.built_temp_key = temp_key;
+  t.built_trim_active = trim_on;
+  for (int ch = 0; ch < 3; ch++) {
+    t.built_trim[ch] = trim[ch];
+  }
   if (!t.model_valid) {
     const double *dark_buf[3];
     BuildUdfpsPhysicsTable(level, mask_level, t.gamma, t.wb, t.pexp, t.toe, t.toe_knee, alpha,
-                           UdfpsDarkPtrs(t, dark_buf), t.lut);
+                           UdfpsDarkPtrs(t, dark_buf), trim_on ? trim : nullptr, t.lut);
     int l = std::max(0, std::min(kUdfpsLevels - 1, static_cast<int>(level)));
     int m = std::max(l, std::max(0, std::min(kUdfpsLevels - 1, mask_level)));
     double base = UdfpsPhysicsBase(level, mask_level, t.gamma);
@@ -3084,17 +3273,29 @@ bool BuildUdfpsAutoLut(float level, int alpha, bool published, int mask_level) {
     } else {
       snprintf(res_state, sizeof(res_state), "%s", t.residual_valid ? "off (all zero)" : "off");
     }
+    char temp_state[160];
+    if (!std::isfinite(t.temp)) {
+      snprintf(temp_state, sizeof(temp_state), "unknown, no trim");
+    } else if (!t.tcoef_set) {
+      snprintf(temp_state, sizeof(temp_state), "%.1f C (T %.1f), no trim (tcoef unset)", t.temp,
+               temp_q);
+    } else {
+      snprintf(temp_state, sizeof(temp_state),
+               "%.1f C (T %.1f, ref %.1f, k r/g/b %.4f/%.4f/%.4f), trim r/g/b %.4f/%.4f/%.4f%s",
+               t.temp, temp_q, t.tref, t.tcoef[0], t.tcoef[1], t.tcoef[2], trim[0], trim[1],
+               trim[2], trim_on ? "" : " (none)");
+    }
     DLOGI("IchthysOS udfps_lut: physics curve for panel level %d (%d cd) under mask level %d "
           "(%d cd), separator alpha %d (%s): A r/g/b %.3f/%.3f/%.3f, p %.3f, toe r/g/b "
           "%.4f/%.4f/%.4f knee %.3f, toe alone r/g/b %.4f/%.4f/%.4f, dark r/g/b %s/%s/%s, "
-          "3D gamut %s, residual %s", l, cd_l, m,
+          "3D gamut %s, residual %s, temperature %s", l, cd_l, m,
           cd_m, alpha, published ? "SystemUI" : "sep_keep", t.wb[0] * base, t.wb[1] * base,
           t.wb[2] * base, expo, UdfpsToeEffective(t.toe[0], t.toe_knee),
           UdfpsToeEffective(t.toe[1], t.toe_knee), UdfpsToeEffective(t.toe[2], t.toe_knee),
           t.toe_knee, ta[0], ta[1], ta[2], t.dark_active[0] ? "on" : "off",
           t.dark_active[1] ? "on" : "off", t.dark_active[2] ? "on" : "off",
           UdfpsGamutWanted() ? "on" : (t.toe_alone_set ? "off (toe alone = toe)" : "off (unset)"),
-          res_state);
+          res_state, temp_state);
     return true;
   }
   t.built_physics = false;
@@ -3274,7 +3475,8 @@ void *HWDeviceDRM::BuildFingerprintGamut(bool mask_table, int *changed) {
   *changed = BuildUdfpsGamutTable(base_nodes, gc_mode, t.lut, t.built_gain, t.built_expo,
                                   t.built_alpha, t_grey, t_alone, t.toe_knee, grid,
                                   UdfpsResidualActive() ? t.residual : nullptr, t.residual_levels,
-                                  UdfpsDarkPtrs(t, dark_buf), table_nodes);
+                                  UdfpsDarkPtrs(t, dark_buf),
+                                  t.built_trim_active ? t.built_trim : nullptr, table_nodes);
   for (int n = 0; n < kUdfpsGamutNodes; n++) {
     drm_msm_3d_col &col = out->col[UdfpsGamutTable(n)][UdfpsGamutEntry(n)];
     col.c0 = table_nodes[n][0];
@@ -3344,6 +3546,9 @@ void HWDeviceDRM::SetupFingerprintLut(bool fod_present, bool mask_on_edge) {
         } else if (mask_on_edge || table_changed) {
           DLOGW("IchthysOS udfps_lut: panel level unreadable, %s",
                 level >= 0.0f ? "keeping the last one" : "no model curve");
+        }
+        if (!g_udfps_lut.model_valid) {
+          UpdateUdfpsTemp();  // IchthysOS: the physics curve's temperature trim, read with it
         }
       }
       bool published = false;
